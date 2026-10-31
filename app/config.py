@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     secrets_backend: Literal["keyring", "systemd"] = "keyring"
     credentials_dir: Path | None = None
     auth_mode: Literal["google", "tailscale"] = "google"
-    owner_email: str = "owner@example.com"
+    owner_email: str = ""  # required in Google mode; the server refuses to start without it
     owner_tailscale_login: str = ""
     public_url: str = "http://127.0.0.1:8765"
     bind_port: int = 8765

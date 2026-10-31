@@ -79,8 +79,8 @@ AUTH_MODE=google
 # Client ID of the Web application OAuth client (public; its secret is the login-client-secret credential).
 LOGIN_CLIENT_ID=
 
-# Defaults to the owner's address in app/config.py; set it only to change the account.
-# OWNER_EMAIL=
+# Required when AUTH_MODE=google: the one Google account allowed to sign in.
+OWNER_EMAIL=
 
 # Only for AUTH_MODE=tailscale: the owner's Tailscale login, e.g. name@github (see docs/REMOTE.md).
 OWNER_TAILSCALE_LOGIN=
