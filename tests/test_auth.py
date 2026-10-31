@@ -217,3 +217,15 @@ def test_cli_playlists_lists_ids(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_client", lambda: (RealYouTube(svc, QuotaMeter()), None))
     assert cli.main(["playlists"]) == 0
     assert "PL1  Music" in capsys.readouterr().out
+
+
+def test_cli_survives_emoji_on_cp1252_console(monkeypatch):
+    import io
+    import sys
+    from app import cli
+    out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", out)
+    cli._safe_console()
+    print("PL123  hype \U0001f525 mix")
+    out.flush()
+    assert b"hype ? mix" in out.buffer.getvalue()

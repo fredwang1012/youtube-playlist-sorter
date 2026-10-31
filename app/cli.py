@@ -99,7 +99,15 @@ AUTH_EXPIRED = (
 )
 
 
+def _safe_console() -> None:
+    # video and playlist titles carry emoji; a cp1252 console (or a redirected log) cannot encode them
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+
+
 def main(argv: list[str] | None = None) -> int:
+    _safe_console()
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     parser.add_argument("command", choices=COMMANDS)
     parser.add_argument("--graph", help="graph file (run, preview)")
