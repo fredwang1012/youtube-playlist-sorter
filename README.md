@@ -151,6 +151,8 @@ per Pacific day and stops inserting before the budget (default 8000), so a bad d
 | `videos.list` | 1 unit per 50 videos |
 | `playlists.list` (my playlists) | 1 unit |
 | `subscriptions.list` | 1 unit per page of 50, cached for 24 hours |
+| `channels.list` + `playlistItems.list` (uploads fallback, per channel) | 2 units |
+| `playlistItems.list` (check after a crash) | 1 unit |
 | `playlistItems.insert` | 50 units |
 
 A worked day: 150 subscriptions, about 60 new uploads, 25 of them match a rule.
@@ -174,6 +176,8 @@ run summary shows the units used this run and today.
 - **No duplicates, even after a crash.** Each insert is recorded in SQLite before it is sent. If the process dies
   mid-insert, the next run sees the open record, asks YouTube whether the video is already in the playlist (1 unit),
   and inserts only if it is not. A recorded filing is never inserted twice.
+- **Residual risk.** The HTTP library may resend a request once if the connection drops mid-call. In that rare case
+  YouTube could add the same video twice. It is the one gap the duplicate check cannot close.
 - **Full playlists.** A playlist that hits YouTube's 5000-item limit is skipped for 24 hours and its filings stay
   queued.
 - **Token storage.** The refresh token lives in the Windows Credential Manager through `keyring`, never in a file,
@@ -202,6 +206,10 @@ schtasks /Query /TN "YouTube Playlist Sorter" /V /FO LIST
 schtasks /Delete /TN "YouTube Playlist Sorter" /F
 ```
 
+Exit codes: 0 success, 1 error or invalid graph, 2 Google sign-in expired or revoked (run `auth`), 3 another run is
+already in progress (real runs take a lock on `data/run.lock`; dry runs and `preview` do not), 4 network unavailable
+(try again later; anything already filed stays recorded and queued filings are kept).
+
 Read the log with `Get-Content data\run.log -Tail 40` in PowerShell. If it says Google sign-in expired or was
 revoked, run `auth` again.
 
@@ -216,9 +224,9 @@ and `tests/test_e2e.py` runs the example graph through a dry run, a run, a repea
 
 ## Limitations
 
-- An RSS feed lists only a channel's latest 15 videos. A channel that uploads more than 15 between runs loses the
-  older ones, so run the job at least daily. If a feed fails, the tool reads the channel's uploads playlist instead
-  (1 unit).
+- An RSS feed lists only a channel's latest 15 videos. When a full feed has no video the tool has seen before, or the
+  feed fails to load, it reads the channel's uploads playlist instead (2 units), which covers a larger gap. A burst
+  of uploads bigger than that gap between two runs can still be missed, so run the job at least daily.
 - Watch Later is not accessible through the API.
 - Filters see only what YouTube returns for a video: title, description, tags, duration, category. Nothing reads the
   transcript or the picture.

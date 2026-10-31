@@ -15,7 +15,6 @@ class Settings(BaseSettings):
     client_secret_path: Path = Path("~/.config/youtube-playlist-sorter/client_secret.json")
     daily_quota_budget: int = 8000
     allow_any_playlist: bool = False
-    timezone: str = "America/Toronto"
 
     @field_validator("data_dir")
     @classmethod

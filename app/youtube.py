@@ -72,13 +72,22 @@ def _reason(err: HttpError) -> str:
         return ""
 
 
+def _message(err: HttpError) -> str:
+    try:
+        return str(json.loads(err.content)["error"].get("message", ""))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return ""
+
+
 def _map_error(err: HttpError, what: str) -> YouTubeError:
     status = getattr(err.resp, "status", None)
     reason = _reason(err)
     if reason in ("quotaExceeded", "dailyLimitExceeded"):
         return QuotaExceededError(f"YouTube quota exceeded during {what}. It resets at midnight Pacific time.")
-    if reason in ("rateLimitExceeded", "userRateLimitExceeded"):
+    if status == 429 or reason in ("rateLimitExceeded", "userRateLimitExceeded", "RESOURCE_EXHAUSTED"):
         return RateLimitedError(f"YouTube rate limit hit during {what}; wait a bit and retry.")
+    if status == 409 and (reason == "SERVICE_UNAVAILABLE" or "aborted" in _message(err).lower()):
+        return ServerError(f"YouTube aborted the request during {what}.")  # may have been applied
     if reason == "videoAlreadyInPlaylist":
         return AlreadyInPlaylistError(f"Video is already in the playlist ({what}).")
     if reason == "playlistContainsMaximumNumberOfVideos":
@@ -155,7 +164,7 @@ class RealYouTube:
         for i in range(0, len(ids), VIDEOS_BATCH):
             batch = ids[i : i + VIDEOS_BATCH]
             resp = self._run(
-                self._svc.videos().list(part="snippet,contentDetails", id=",".join(batch), maxResults=VIDEOS_BATCH),
+                self._svc.videos().list(part="snippet,contentDetails", id=",".join(batch)),
                 "videos.list",
                 READ_COST,
             )

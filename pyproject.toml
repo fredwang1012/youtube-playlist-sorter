@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "Daily rule-based filing of new YouTube uploads into the owner's playlists, within the API quota"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "feedparser>=6.0.14",
     "google-api-python-client>=2.201.0",
     "google-auth>=2.62.0",
     "google-auth-oauthlib>=1.5.0",

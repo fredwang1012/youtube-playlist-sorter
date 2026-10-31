@@ -3,7 +3,11 @@ import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 
+import httplib2
 import pytest
+from google.auth.exceptions import TransportError
+from googleapiclient.errors import HttpError
+from httplib2 import Response
 
 from app import auth, cli, run as runner
 from app.config import settings
@@ -556,3 +560,55 @@ def test_pending_rows_for_other_playlists_are_reported_and_kept(state):
     assert r.orphaned == 1 and state.pending_rows() == [("old", OTHER, CH, 0)]
     assert "1 queued filings target playlists not in this graph" in runner.render(r)
     assert yt.inserts == []
+
+
+# --- error mapping, run lock, network down ---
+
+def test_429_and_resource_exhausted_are_rate_limits():
+    assert isinstance(_map_error(http_error(429, ""), "x"), RateLimitedError)
+    assert isinstance(_map_error(http_error(403, "RESOURCE_EXHAUSTED"), "x"), RateLimitedError)
+
+
+def test_409_aborted_is_ambiguous_server_error():
+    assert isinstance(_map_error(http_error(409, "SERVICE_UNAVAILABLE"), "x"), ServerError)
+    body = json.dumps({"error": {"errors": [{"reason": "conflict"}], "message": "The operation was ABORTED."}}).encode()
+    err = _map_error(HttpError(Response({"status": 409}), body), "x")
+    assert isinstance(err, ServerError)
+
+
+def test_videos_list_sends_no_max_results():
+    svc = FakeService(videos=[{"items": []}])
+    RealYouTube(svc, QuotaMeter()).videos(["a", "b"])
+    assert "maxResults" not in svc.log[0][2]
+
+
+def test_second_real_run_exits_3_while_lock_is_held(monkeypatch, capsys, tmp_path):
+    from app.lock import run_lock
+    gpath = tmp_path / "g.json"
+    gpath.write_text(json.dumps({"version": 1, "nodes": [
+        {"id": "s", "type": "source.channel", "params": {"channel_id": CH}},
+        {"id": "d", "type": "destination.playlist", "params": {"playlist_id": PL1}}],
+        "edges": [{"from": "s", "to": "d"}]}))
+    yt = FakeYT()
+    monkeypatch.setattr(cli, "_client", lambda: (yt, yt.meter))
+    monkeypatch.setattr(runner, "fetch_url", fetcher(["v1"]))
+    with run_lock(settings.data_dir / "run.lock"):
+        assert cli.main(["run", "--graph", str(gpath)]) == 3
+        assert "another run is in progress" in capsys.readouterr().err.lower()
+        assert cli.main(["run", "--graph", str(gpath), "--dry-run"]) == 0  # dry runs do not lock
+    capsys.readouterr()
+    assert yt.inserts == []
+    assert cli.main(["run", "--graph", str(gpath)]) == 0  # released afterwards
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("exc", [TimeoutError(), ConnectionResetError(), httplib2.ServerNotFoundError("dns"),
+                                 TransportError("down")])
+def test_network_down_exits_4_without_traceback(monkeypatch, capsys, exc):
+    def boom():
+        raise exc
+
+    monkeypatch.setattr(cli, "_client", boom)
+    assert cli.main(["whoami"]) == 4
+    err = capsys.readouterr().err
+    assert err == "Error: network unavailable, try again later.\n"

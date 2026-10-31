@@ -3,9 +3,13 @@ import argparse
 import sys
 from datetime import datetime, timezone
 
+import httplib2
+from google.auth.exceptions import TransportError
+
 from app import auth
 from app import run as runner
 from app.config import settings
+from app.lock import AlreadyRunning, run_lock
 from app.graph import GraphError, NotImplementedInThisVersion, load_graph
 from app.state import State
 from app.youtube import QuotaMeter, RealYouTube, YouTubeError
@@ -50,12 +54,26 @@ def _graph(path: str):
     except GraphError as err:
         print("Graph is invalid:", *(f"  {e}" for e in err.errors), sep="\n", file=sys.stderr)
         return None
+    except OSError as err:
+        print(f"Error: cannot read graph file {path}: {err.strerror or type(err).__name__}", file=sys.stderr)
+        return None
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     graph = _graph(args.graph)
     if graph is None:
         return 1
+    if args.dry_run:
+        return _run_once(graph, args)
+    try:
+        with run_lock(settings.data_dir / "run.lock"):
+            return _run_once(graph, args)
+    except AlreadyRunning:
+        print("Another run is in progress; exiting.", file=sys.stderr)
+        return 3
+
+
+def _run_once(graph, args: argparse.Namespace) -> int:
     yt, meter = _client()
     state = State.throwaway_copy() if args.dry_run else State()
     try:
@@ -100,10 +118,10 @@ AUTH_EXPIRED = (
 
 
 def _safe_console() -> None:
-    # video and playlist titles carry emoji; a cp1252 console (or a redirected log) cannot encode them
+    # titles carry emoji; pipes and redirected logs (data\run.log) get UTF-8, an interactive console is unaffected
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
-            stream.reconfigure(errors="replace")
+            stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -132,6 +150,9 @@ def main(argv: list[str] | None = None) -> int:
     except (auth.AuthError, YouTubeError) as err:
         print(f"Error: {err}", file=sys.stderr)
         return 1
+    except (TransportError, httplib2.ServerNotFoundError, OSError):  # OSError covers timeouts and resets
+        print("Error: network unavailable, try again later.", file=sys.stderr)
+        return 4
 
 
 if __name__ == "__main__":

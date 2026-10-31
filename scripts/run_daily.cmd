@@ -1,6 +1,7 @@
 @echo off
 rem Daily run for Task Scheduler. Appends output to data\run.log (the tool never prints tokens).
 rem Optional first argument: graph file, default graphs\mine.yaml.
+set PYTHONUTF8=1
 cd /d "%~dp0.."
 if not exist data mkdir data
 set GRAPH=%~1

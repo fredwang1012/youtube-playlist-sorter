@@ -62,7 +62,6 @@ def test_relative_data_dir_anchored_to_root():
 def test_defaults():
     s = Settings()
     assert s.daily_quota_budget == 8000
-    assert s.timezone == "America/Toronto"
     assert s.client_secret_path.parts[-2:] == ("youtube-playlist-sorter", "client_secret.json")
     assert "~" not in str(s.client_secret_path)
 
@@ -228,4 +227,4 @@ def test_cli_survives_emoji_on_cp1252_console(monkeypatch):
     cli._safe_console()
     print("PL123  hype \U0001f525 mix")
     out.flush()
-    assert b"hype ? mix" in out.buffer.getvalue()
+    assert "hype 🔥 mix".encode("utf-8") in out.buffer.getvalue()
