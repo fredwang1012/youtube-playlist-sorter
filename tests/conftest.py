@@ -38,6 +38,8 @@ def memory_keyring():
 def _isolated_settings(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
     monkeypatch.setattr(settings, "client_secret_path", tmp_path / "client_secret.json")
+    monkeypatch.setattr(settings, "secrets_backend", "keyring")
+    monkeypatch.setattr(settings, "credentials_dir", None)
 
 
 @pytest.fixture

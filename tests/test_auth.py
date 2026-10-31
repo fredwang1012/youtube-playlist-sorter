@@ -6,7 +6,7 @@ from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 from httplib2 import Response
 
-from app import auth, cli
+from app import auth, cli, secretstore
 from app.config import ROOT, Settings
 from app.youtube import ForbiddenError, NotFoundError, QuotaExceededError, QuotaMeter, RateLimitedError, RealYouTube
 
@@ -93,7 +93,8 @@ def test_run_auth_stores_token_in_keychain(client_secret, memory_keyring, monkey
 
     monkeypatch.setattr(auth.InstalledAppFlow, "from_client_secrets_file", fake_from_file)
     auth.run_auth()
-    assert memory_keyring.store[(auth.KEYRING_SERVICE, auth.KEYRING_USER)] == "refresh-abc"
+    assert memory_keyring.store[("youtube-playlist-sorter", "refresh-token")] == "refresh-abc"
+    assert secretstore.get("refresh-token") == "refresh-abc"
     assert seen["scopes"] == ["https://www.googleapis.com/auth/youtube.force-ssl"]
     assert seen["host"] == "127.0.0.1"
     assert seen["prompt"] == "consent"
@@ -102,7 +103,7 @@ def test_run_auth_stores_token_in_keychain(client_secret, memory_keyring, monkey
 
 
 def test_load_credentials_refreshes_from_keychain(client_secret, memory_keyring, monkeypatch):
-    memory_keyring.set_password(auth.KEYRING_SERVICE, auth.KEYRING_USER, "refresh-abc")
+    memory_keyring.set_password("youtube-playlist-sorter", "refresh-token", "refresh-abc")
     monkeypatch.setattr(auth.Credentials, "refresh", lambda self, request: setattr(self, "token", "access-1"))
     creds = auth.load_credentials()
     assert creds.token == "access-1"
@@ -111,7 +112,7 @@ def test_load_credentials_refreshes_from_keychain(client_secret, memory_keyring,
 
 
 def test_revoked_token_says_rerun_auth(client_secret, memory_keyring, monkeypatch):
-    memory_keyring.set_password(auth.KEYRING_SERVICE, auth.KEYRING_USER, "refresh-abc")
+    memory_keyring.set_password("youtube-playlist-sorter", "refresh-token", "refresh-abc")
 
     def boom(self, request):
         raise RefreshError("invalid_grant refresh-abc")
@@ -120,6 +121,31 @@ def test_revoked_token_says_rerun_auth(client_secret, memory_keyring, monkeypatc
     with pytest.raises(auth.AuthError) as e:
         auth.load_credentials()
     assert "re-run" in str(e.value).lower()
+    assert "refresh-abc" not in str(e.value)
+
+
+def test_load_credentials_from_systemd_credentials(client_secret, tmp_path, monkeypatch):
+    creds_dir = tmp_path / "creds"
+    creds_dir.mkdir()
+    (creds_dir / "refresh-token").write_text("refresh-vm\n", encoding="utf-8")
+    monkeypatch.setattr(auth.settings, "secrets_backend", "systemd")
+    monkeypatch.setattr(auth.settings, "credentials_dir", creds_dir)
+    monkeypatch.setattr(auth.Credentials, "refresh", lambda self, request: setattr(self, "token", "access-1"))
+    assert auth.load_credentials().refresh_token == "refresh-vm"
+
+
+def test_run_auth_on_read_only_store_explains(client_secret, tmp_path, monkeypatch):
+    monkeypatch.setattr(auth.settings, "secrets_backend", "systemd")
+    monkeypatch.setattr(auth.settings, "credentials_dir", tmp_path)
+
+    class FakeFlow:
+        def run_local_server(self, **kw):
+            return SimpleNamespace(refresh_token="refresh-abc")
+
+    monkeypatch.setattr(auth.InstalledAppFlow, "from_client_secrets_file", lambda path, scopes: FakeFlow())
+    with pytest.raises(auth.AuthError) as e:
+        auth.run_auth()
+    assert "systemd-creds encrypt" in str(e.value)
     assert "refresh-abc" not in str(e.value)
 
 
