@@ -1,7 +1,7 @@
 """Run command: detection -> graph -> inserts with the quota guard, against a fake YouTube client."""
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -499,3 +499,60 @@ def test_playlist_contains_costs_one_unit_and_is_read_only():
 
 def test_5xx_maps_to_server_error():
     assert isinstance(_map_error(http_error(503, "backendError"), "x"), ServerError)
+
+
+# --- follow-ups: full playlists, pending failures, orphaned rows ---
+
+def test_playlist_full_keeps_the_filing_queued(state):
+    yt = FakeYT()
+    yt.insert_errors[(PL1, "v1")] = [PlaylistFullError("full")]
+    go(graph(), yt, state, ["v1", "v2"])
+    assert {row[0] for row in state.pending_rows()} == {"v1", "v2"}  # the one that hit it and the one skipped
+    assert all(row[3] == 0 for row in state.pending_rows())
+
+
+def test_full_playlist_is_remembered_for_24_hours(state):
+    yt = FakeYT()
+    yt.insert_errors[(PL1, "v1")] = [PlaylistFullError("full")]
+    go(graph(), yt, state, ["v1"])
+    assert state.kv_get("playlist_full:" + PL1) is not None
+    fresh_meter(yt)
+    before = yt.calls.count("insert")
+    later = NOW + timedelta(hours=23)
+    r = runner.run(graph(), yt, state, yt.meter, later, 8000, fetch=fetcher(["v1"]), sleep=lambda _s: None)
+    assert yt.calls.count("insert") == before and PL1 in r.full_playlists
+    assert [row[0] for row in state.pending_rows()] == ["v1"]
+
+
+def test_full_playlist_is_tried_again_after_24_hours(state):
+    yt = FakeYT()
+    yt.insert_errors[(PL1, "v1")] = [PlaylistFullError("full")]
+    go(graph(), yt, state, ["v1"])
+    fresh_meter(yt)
+    later = NOW + timedelta(hours=25)
+    r = runner.run(graph(), yt, state, yt.meter, later, 8000, fetch=fetcher(["v1"]), sleep=lambda _s: None)
+    assert yt.inserts == [(PL1, "v1")] and not r.full_playlists
+    assert state.kv_get("playlist_full:" + PL1) is None and state.pending_rows() == []
+
+
+def test_carried_over_filing_that_keeps_failing_is_given_up_after_three_runs(state):
+    yt = FakeYT()
+    state.queue_pending("old", PL1, CH, NOW, "deferred")  # not in the feed any more
+    yt.insert_errors[(PL1, "old")] = [YouTubeError("nope")] * 3
+    for n in (1, 2):
+        fresh_meter(yt)
+        go(graph(), yt, state, [])
+        assert state.failures("old") == n and state.pending_rows() == [("old", PL1, CH, 0)]
+    fresh_meter(yt)
+    r = go(graph(), yt, state, [])
+    assert r.gave_up == ["old"] and state.pending_rows() == [] and state.gave_up() == [("old", "nope")]
+    assert yt.inserts == []
+
+
+def test_pending_rows_for_other_playlists_are_reported_and_kept(state):
+    yt = FakeYT()
+    state.queue_pending("old", OTHER, CH, NOW, "deferred")
+    r = go(graph(), yt, state, [])
+    assert r.orphaned == 1 and state.pending_rows() == [("old", OTHER, CH, 0)]
+    assert "1 queued filings target playlists not in this graph" in runner.render(r)
+    assert yt.inserts == []

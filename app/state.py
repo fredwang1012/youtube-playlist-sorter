@@ -127,6 +127,10 @@ class State:
                 (key, value, now.isoformat()),
             )
 
+    def kv_delete(self, key: str) -> None:
+        with self._db:
+            self._db.execute("DELETE FROM kv WHERE key = ?", (key,))
+
     def failures(self, video_id: str) -> int:
         row = self._db.execute("SELECT failures FROM attempts WHERE video_id = ?", (video_id,)).fetchone()
         return row[0] if row else 0

@@ -35,6 +35,8 @@ SUBS_CACHE_TTL = timedelta(hours=24)
 MAX_FAILED_RUNS = 3
 RATE_LIMIT_PAUSE_SECONDS = 2
 PLAYLIST_LIMIT = 5000
+FULL_KEY = "playlist_full:"  # kv key prefix; the timestamp says when the playlist was found full
+FULL_TTL = timedelta(hours=24)
 
 
 def quota_day(now: datetime) -> str:
@@ -52,6 +54,7 @@ class Report:
     errors: list[str] = field(default_factory=list)
     config_errors: list[str] = field(default_factory=list)
     gave_up: list[str] = field(default_factory=list)
+    orphaned: int = 0  # queued filings whose playlist is not a destination in this graph (kept, not deleted)
     full_playlists: set[str] = field(default_factory=set)
     quota_stopped: bool = False
     units_run: int = 0  # units this run spent (dry run: on detection reads)
@@ -147,7 +150,9 @@ class _Ctx:
             rep.already += 1
             return "done", ""
         if pid in rep.full_playlists:
+            st.queue_pending(video_id, pid, channel_id, now, "playlist full")
             return "full", ""
+        was_pending = st.pending_attempts(video_id, pid) is not None
         label = f"{video_id} -> {rep.titles.get(pid, pid)}"
         try:
             if st.pending_attempts(video_id, pid):  # an earlier attempt may have been accepted: look before inserting
@@ -183,7 +188,8 @@ class _Ctx:
             rep.already += 1
             return "done", ""
         except PlaylistFullError:
-            st.drop_pending(video_id, pid)
+            st.queue_pending(video_id, pid, channel_id, now, "playlist full")
+            st.kv_set(FULL_KEY + pid, "1", now)
             rep.full_playlists.add(pid)
             rep.errors.append(f"playlist {rep.titles.get(pid, pid)} is full ({PLAYLIST_LIMIT} items); skipping it")
             return "full", ""
@@ -191,7 +197,8 @@ class _Ctx:
             rep.errors.append(f"insert {label}: {err} Outcome unknown; will verify next run.")
             return "queued", ""
         except YouTubeError as err:
-            st.drop_pending(video_id, pid)
+            if not was_pending:  # a carried-over filing stays queued; the caller counts the failure
+                st.drop_pending(video_id, pid)
             rep.errors.append(f"insert {label}: {err}")
             return "failed", str(err)
         except Exception as err:  # timeout, network error: the insert may or may not have happened
@@ -233,6 +240,7 @@ def run(
             ctx.flush()
             dests = set(_destinations(graph))
             report.deferred = sum(1 for _v, pid, _c, _a in state.pending_rows() if pid in dests)
+        report.orphaned = sum(1 for _v, pid, _c, _a in state.pending_rows() if pid not in _destinations(graph))
         report.units_today = state.quota_used(day)
         if not dry_run:
             state.finish_run(run_id, now, _summary(report))
@@ -259,6 +267,14 @@ def _run(ctx: _Ctx, graph: Graph, allow_any: bool, fetch: Fetcher, backfill: int
                 "set allow_any_playlist=true to override" for pid in foreign
             ]
             return
+
+    for pid in dests:  # playlists found full within the last 24 hours are skipped without an API call
+        entry = state.kv_get(FULL_KEY + pid)
+        if entry and now - entry[1] < FULL_TTL:
+            report.full_playlists.add(pid)
+            report.errors.append(f"playlist {report.titles[pid]} was full within the last 24 hours; skipping it")
+        elif entry:
+            state.kv_delete(FULL_KEY + pid)
 
     # Filings carried over from earlier runs go first; they do not depend on the RSS window.
     handled: dict[tuple[str, str], tuple[str, str]] = {}
@@ -289,16 +305,19 @@ def _run(ctx: _Ctx, graph: Graph, allow_any: bool, fetch: Fetcher, backfill: int
         _project(report, state, ctx.day, result, by_id, filings, ctx.meter, set(dests))
         return
 
+    settled: set[tuple[str, str]] = set()
     for v in videos:
         pids = filings.get(v.video_id)
         if not pids:  # nothing to file: fully handled
             state.mark_seen(v.video_id, v.channel_id, now)
             continue
         results = [handled.get((v.video_id, pid)) or ctx.file(v.video_id, v.channel_id, pid) for pid in pids]
-        _settle(state, report, v, now, results)
+        settled.update((v.video_id, pid) for pid in pids)
+        _settle(state, report, v, now, pids, results)
+    _settle_pending(state, report, now, handled, settled)
 
 
-def _settle(state: State, report: Report, v: Video, now, results: list[tuple[str, str]]) -> None:
+def _settle(state: State, report: Report, v: Video, now, pids: list[str], results: list[tuple[str, str]]) -> None:
     """Mark the video seen once every filing is done or queued (the queue carries it over).
 
     A definite failure counts toward the give-up cap, but a video with filings still unfinished (queued or in a full
@@ -311,8 +330,28 @@ def _settle(state: State, report: Report, v: Video, now, results: list[tuple[str
         if state.record_failure(v.video_id, "; ".join(failed)[:300], MAX_FAILED_RUNS, allow_give_up=not unfinished):
             state.mark_seen(v.video_id, v.channel_id, now)
             report.gave_up.append(v.video_id)
+            for pid, (s, _m) in zip(pids, results):
+                if s == "failed":
+                    state.drop_pending(v.video_id, pid)
     elif "full" not in statuses:
         state.mark_seen(v.video_id, v.channel_id, now)
+
+
+def _settle_pending(state: State, report: Report, now, handled, settled) -> None:
+    """Count definite failures of carried-over filings that no feed video settled, with the same 3-run give-up rule."""
+    by_video: dict[str, list[tuple[str, tuple[str, str]]]] = {}
+    for (vid, pid), res in handled.items():
+        if (vid, pid) not in settled:
+            by_video.setdefault(vid, []).append((pid, res))
+    for vid, items in by_video.items():
+        failed = [(pid, m) for pid, (s, m) in items if s == "failed"]
+        if not failed:
+            continue
+        unfinished = any(s in ("queued", "full") for _p, (s, _m) in items)
+        if state.record_failure(vid, "; ".join(m for _p, m in failed)[:300], MAX_FAILED_RUNS, allow_give_up=not unfinished):
+            report.gave_up.append(vid)
+            for pid, _m in failed:
+                state.drop_pending(vid, pid)
 
 
 def _project(report, state, day, result, by_id, filings, meter, dests) -> None:
@@ -361,6 +400,8 @@ def render(report: Report, graph: Graph | None = None) -> str:
             lines += [f"  {nid}: {n}" for nid, n in sorted(report.dropped_by_node.items())]
     if report.deferred:
         lines.append(f"Deferred to the next run: {report.deferred} filing(s)")
+    if report.orphaned:
+        lines.append(f"{report.orphaned} queued filings target playlists not in this graph")
     if report.gave_up:
         lines.append(f"Gave up after {MAX_FAILED_RUNS} failed runs: {', '.join(report.gave_up)}")
     if report.errors:
