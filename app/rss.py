@@ -1,4 +1,5 @@
 """Free new-upload feed: YouTube's per-channel Atom feed costs no API quota."""
+import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -11,6 +12,9 @@ USER_AGENT = "youtube-playlist-sorter/0.1 (+https://github.com/fredwang1012/yout
 TIMEOUT_SECONDS = 15
 MAX_BYTES = 2_000_000
 FEED_SIZE = 15  # YouTube returns at most this many entries
+# the feed endpoint intermittently answers 404/5xx for valid channels; a retry is free, the API fallback is not
+ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 1.0
 
 NS = {
     "atom": "http://www.w3.org/2005/Atom",
@@ -65,5 +69,15 @@ def parse_feed(xml: bytes) -> list[FeedEntry]:
     return entries
 
 
-def fetch_feed(channel_id: str, fetch: Fetcher = fetch_url) -> list[FeedEntry]:
-    return parse_feed(fetch(FEED_URL.format(channel_id=channel_id)))
+def fetch_feed(
+    channel_id: str, fetch: Fetcher = fetch_url, sleep: Callable[[float], None] = time.sleep
+) -> list[FeedEntry]:
+    url = FEED_URL.format(channel_id=channel_id)
+    for attempt in range(ATTEMPTS):
+        try:
+            return parse_feed(fetch(url))
+        except RssError:
+            if attempt == ATTEMPTS - 1:
+                raise
+            sleep(RETRY_DELAY_SECONDS * (attempt + 1))
+    raise AssertionError("unreachable")

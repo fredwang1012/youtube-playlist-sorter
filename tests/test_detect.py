@@ -394,3 +394,29 @@ def test_same_id_in_two_feeds_is_enriched_once(state):
     out = run(state, yt, {a: feed_xml(a, ["dup", "a1"]), b: feed_xml(b, ["dup"])})
     assert [v.video_id for v in out.videos] == ["dup", "a1"]
     assert [c[1] for c in yt.calls if c[0] == "videos"] == [["dup", "a1"]]
+
+
+def test_feed_retries_transient_failures_then_succeeds():
+    calls = []
+
+    def flaky(url):
+        calls.append(url)
+        if len(calls) < 3:
+            raise rss.RssError("Could not fetch feed: HTTP Error 404")
+        return FIXTURE.read_bytes()
+
+    slept = []
+    entries = rss.fetch_feed(CH, flaky, sleep=slept.append)
+    assert entries and len(calls) == 3 and len(slept) == 2
+
+
+def test_feed_gives_up_after_three_attempts():
+    calls = []
+
+    def down(url):
+        calls.append(url)
+        raise rss.RssError("Could not fetch feed: HTTP Error 404")
+
+    with pytest.raises(rss.RssError):
+        rss.fetch_feed(CH, down, sleep=lambda s: None)
+    assert len(calls) == 3

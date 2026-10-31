@@ -49,3 +49,9 @@ def client_secret(tmp_path):
         encoding="utf-8",
     )
     return path
+
+
+@pytest.fixture(autouse=True)
+def _no_rss_retry_delay(monkeypatch):
+    from app import rss
+    monkeypatch.setattr(rss, "RETRY_DELAY_SECONDS", 0.0)
