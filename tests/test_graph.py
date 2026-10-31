@@ -231,10 +231,110 @@ def test_group_and_subscriptions_sources():
     g = graph([{"id": "g", "type": "source.channel_group", "params": {"channel_ids": [CH_A, CH_B]}},
                {"id": "subs", "type": "source.subscriptions"}, dest()],
               [{"from": "g", "to": "d"}, {"from": "subs", "to": "d"}])
-    assert execute(g, [vid(channel=CH_B)], NOW).filings == [("v1", PL1)]
+    assert execute(g, [vid(channel=CH_B)], NOW, subscriptions=set()).filings == [("v1", PL1)]
     other = "UC" + "q" * 22
     assert execute(g, [vid(channel=other)], NOW, subscriptions={other}).filings == [("v1", PL1)]
     assert not execute(g, [vid(channel=other)], NOW, subscriptions={CH_A}).filings
+
+
+def test_subscriptions_set_required():
+    g = graph([{"id": "subs", "type": "source.subscriptions"}, dest()], [{"from": "subs", "to": "d"}])
+    with pytest.raises(ValueError, match="subscriptions"):
+        execute(g, [vid()], NOW)
+    with pytest.raises(ValueError, match="resolver"):
+        required_channels(g)
+    plain = graph([src(), dest()], [{"from": "s", "to": "d"}])
+    assert required_channels(plain) == {CH_A}
+    assert execute(plain, [vid()], NOW).filings == [("v1", PL1)]
+
+
+def test_regex_nested_repeat_rejected_at_load():
+    msg = errors_of({"version": 1, "nodes": [src(), filt("f", "filter.regex", pattern="(a+)+$"), dest()],
+                     "edges": [{"from": "s", "to": "f"}, {"from": "f", "to": "d"}]})
+    assert "'f'" in msg and "nests an unbounded repeat" in msg
+
+
+def test_regex_timeout_drops_and_continues():
+    import time
+    # alternation backtracks exponentially without a nested repeat, so it passes the load-time check
+    g = chain("filter.regex", pattern="(a|aa)+$", fields=["title"])
+    start = time.monotonic()
+    r = execute(g, [vid("bad", title="a" * 4000 + "!"), vid("ok", title="aaa")], NOW)
+    assert time.monotonic() - start < 3
+    assert r.filings == [("ok", PL1)]
+    assert r.traces["bad"][-1].reason == "regex timed out" and r.traces["bad"][-1].outcome == "drop"
+    neg = chain("filter.regex", pattern="(a|aa)+$", fields=["title"], negate=True)
+    assert not execute(neg, [vid("bad", title="a" * 4000 + "!")], NOW).filings
+
+
+def test_non_string_edge_endpoints():
+    msg = errors_of({"version": 1, "nodes": [src(), dest()],
+                     "edges": [{"from": ["s"], "to": "d"}, {"from": "s", "to": {"x": 1}}]})
+    assert "must be a node id string" in msg
+
+
+def test_unreachable_reserved_node_still_fails_fast():
+    g = graph([src(), dest(), filt("brain", "filter.llm", prompt="x")], [{"from": "s", "to": "d"}])
+    with pytest.raises(NotImplementedInThisVersion, match="brain"):
+        execute(g, [vid()], NOW)
+
+
+def test_version_must_be_int():
+    for bad in (True, 1.0, "1"):
+        assert "version" in errors_of({"version": bad, "nodes": [src(), dest()], "edges": [{"from": "s", "to": "d"}]})
+
+
+def test_ids_reject_newline_and_non_ascii():
+    assert "'s'" in errors_of({"version": 1, "nodes": [src(ch=CH_A + "\n"), dest()], "edges": [{"from": "s", "to": "d"}]})
+    assert "'s'" in errors_of({"version": 1, "nodes": [src(ch="UC" + "é" * 22), dest()],
+                               "edges": [{"from": "s", "to": "d"}]})
+    assert "'d'" in errors_of({"version": 1, "nodes": [src(), dest(pl="PLabc\n")], "edges": [{"from": "s", "to": "d"}]})
+
+
+def test_filter_self_loop_is_cycle():
+    msg = errors_of({"version": 1, "nodes": [src(), filt("f", "filter.live"), dest()],
+                     "edges": [{"from": "s", "to": "f"}, {"from": "f", "to": "f"}, {"from": "f", "to": "d"}]})
+    assert "cycle: f -> f" in msg
+
+
+def test_destination_without_inbound_warns():
+    g = graph([src(), dest(), dest("orphan", PL2)], [{"from": "s", "to": "d"}])
+    assert any("'orphan'" in w and "no incoming" in w for w in g.warnings)
+
+
+def test_diamond_trace_and_counts():
+    g = graph([src(), filt("a", "filter.live"), filt("b", "filter.live"), filt("c", "filter.live"), dest()],
+              [{"from": "s", "to": "a"}, {"from": "s", "to": "b"}, {"from": "a", "to": "c"},
+               {"from": "b", "to": "c"}, {"from": "c", "to": "d"}])
+    r = execute(g, [vid()], NOW)
+    assert [e.node_id for e in r.traces["v1"]] == ["s", "a", "c", "d", "b"]
+    assert r.node_counts["c"]["pass"] == 1 and r.node_counts["d"]["file"] == 1
+
+
+def test_keyword_special_term_boundaries():
+    cpp = chain("filter.keyword", include=["C++"])
+    assert passes(cpp, vid(title="Learn C++ today"))
+    assert passes(cpp, vid(title="C++"))
+    assert not passes(cpp, vid(title="Learn C+ today"))
+    ai = chain("filter.keyword", include=["AI"])
+    assert passes(ai, vid(title="The AI revolution"))
+    assert not passes(ai, vid(title="Wait for it"))
+    assert not passes(ai, vid(title="MAIN event"))
+
+
+def test_duplicate_video_ids_processed_once():
+    r = execute(chain("filter.live"), [vid(), vid()], NOW)
+    assert r.filings == [("v1", PL1)]
+    assert r.node_counts["s"]["pass"] == 1
+
+
+def test_load_graph_wraps_io_errors(tmp_path):
+    with pytest.raises(GraphError, match="cannot read"):
+        load_graph(tmp_path / "missing.yaml")
+    bad = tmp_path / "bin.yaml"
+    bad.write_bytes(b"\xff\xfe\x00\xd8")
+    with pytest.raises(GraphError, match="cannot read"):
+        load_graph(bad)
 
 
 def test_trace_and_counts():

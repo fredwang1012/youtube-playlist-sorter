@@ -21,9 +21,9 @@ from app.filters import FILTERS, LlmRouterParams, Params, Predicate
 
 SUPPORTED_VERSION = 1
 RESERVED_TYPES = {"filter.llm", "router.llm"}
-_PLAYLIST_PL = re.compile(r"^PL[\w-]+$")
-_PLAYLIST_ANY = re.compile(r"^[\w-]{10,}$")
-_CHANNEL = re.compile(r"^UC[\w-]{22}$")
+_PLAYLIST_PL = re.compile(r"PL[A-Za-z0-9_-]+")
+_PLAYLIST_ANY = re.compile(r"[A-Za-z0-9_-]{10,}")
+_CHANNEL = re.compile(r"UC[A-Za-z0-9_-]{22}")
 
 
 class GraphError(ValueError):
@@ -90,7 +90,7 @@ def _fmt(e: ValidationError) -> str:
 
 
 def _check_channel(cid: str) -> str | None:
-    return None if _CHANNEL.match(cid) else f"channel id {cid!r} must start with 'UC' and be 24 characters"
+    return None if _CHANNEL.fullmatch(cid) else f"channel id {cid!r} must start with 'UC' and be 24 characters"
 
 
 def parse_graph(data: Any) -> Graph:
@@ -101,7 +101,8 @@ def parse_graph(data: Any) -> Graph:
         raise GraphError(["top level must be a mapping"])
     for key in sorted(set(data) - {"version", "settings", "nodes", "edges"}, key=str):
         errors.append(f"unknown top-level key {key!r}")
-    if data.get("version") != SUPPORTED_VERSION:
+    version = data.get("version")
+    if type(version) is not int or version != SUPPORTED_VERSION:
         errors.append(f"version must be {SUPPORTED_VERSION}, got {data.get('version')!r}")
 
     settings = data.get("settings") or {}
@@ -162,7 +163,10 @@ def parse_graph(data: Any) -> Graph:
         src, dst = e["from"], e["to"]
         bad = False
         for end, nid in (("from", src), ("to", dst)):
-            if nid not in nodes:
+            if not isinstance(nid, str):
+                errors.append(f"edges[{i}]: '{end}' must be a node id string, got {nid!r}")
+                bad = True
+            elif nid not in nodes:
                 errors.append(f"edges[{i}]: '{end}' references unknown node {nid!r}")
                 bad = True
         if bad:
@@ -204,9 +208,9 @@ def _check_node_values(nid: str, p: Params, errors: list[str], warnings: list[st
                 errors.append(f"node {nid!r}: {msg}")
     elif isinstance(p, DestinationParams):
         pid = p.playlist_id
-        if _PLAYLIST_PL.match(pid):
+        if _PLAYLIST_PL.fullmatch(pid):
             return
-        if _PLAYLIST_ANY.match(pid):
+        if _PLAYLIST_ANY.fullmatch(pid):
             warnings.append(f"node {nid!r}: playlist id {pid!r} is not PL-prefixed")
         else:
             errors.append(f"node {nid!r}: playlist_id {pid!r} is not a valid playlist id")
@@ -215,19 +219,24 @@ def _check_node_values(nid: str, p: Params, errors: list[str], warnings: list[st
 def _cycle_errors(edges: dict[str, list[str]]) -> list[str]:
     state: dict[str, int] = {}  # 1 = on stack, 2 = done
     errors: list[str] = []
-
-    def visit(n: str, path: list[str]) -> None:
-        state[n] = 1
-        for t in edges.get(n, []):
-            if state.get(t) == 1:
-                errors.append("cycle: " + " -> ".join(path[path.index(t):] + [t]))
-            elif t not in state:
-                visit(t, path + [t])
-        state[n] = 2
-
-    for n in edges:
-        if n not in state:
-            visit(n, [n])
+    for root in edges:
+        if root in state:
+            continue
+        state[root] = 1
+        path = [root]
+        iters = [iter(edges[root])]
+        while iters:
+            for t in iters[-1]:
+                if state.get(t) == 1:
+                    errors.append("cycle: " + " -> ".join(path[path.index(t):] + [t]))
+                elif t not in state:
+                    state[t] = 1
+                    path.append(t)
+                    iters.append(iter(edges[t]))
+                    break
+            else:
+                state[path.pop()] = 2
+                iters.pop()
     return errors
 
 
@@ -248,13 +257,23 @@ def load_graph(path: str | Path) -> Graph:
     """Load a YAML or JSON graph file (yaml.safe_load reads both)."""
     try:
         data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as e:
+        raise GraphError([f"cannot read {path}: {e}"]) from e
     except yaml.YAMLError as e:
         raise GraphError([f"cannot parse {path}: {e}"]) from e
     return parse_graph(data)
 
 
-def required_channels(graph: Graph, subscriptions_resolver: Callable[[], Iterable[str]]) -> set[str]:
-    """Channel ids the graph needs; the resolver is only called if a subscriptions source exists."""
+def _has_subscriptions(graph: Graph) -> bool:
+    return any(isinstance(n.params, SourceSubscriptionsParams) for n in graph.nodes.values())
+
+
+def required_channels(
+    graph: Graph, subscriptions_resolver: Callable[[], Iterable[str]] | None = None
+) -> set[str]:
+    """Channel ids the graph needs. A resolver is required (ValueError otherwise) if there is a subscriptions source."""
+    if subscriptions_resolver is None and _has_subscriptions(graph):
+        raise ValueError("graph has a source.subscriptions node: a subscriptions resolver is required")
     out: set[str] = set()
     for n in graph.nodes.values():
         if isinstance(n.params, SourceChannelParams):
@@ -262,7 +281,7 @@ def required_channels(graph: Graph, subscriptions_resolver: Callable[[], Iterabl
         elif isinstance(n.params, SourceGroupParams):
             out.update(n.params.channel_ids)
         elif isinstance(n.params, SourceSubscriptionsParams):
-            out.update(subscriptions_resolver())
+            out.update(subscriptions_resolver())  # resolver is set here
     return out
 
 
@@ -287,7 +306,7 @@ def _source_accepts(node: Node, channel_id: str, subscriptions: Collection[str] 
     if isinstance(p, SourceGroupParams):
         return channel_id in p.channel_ids
     if isinstance(p, SourceSubscriptionsParams):
-        return subscriptions is None or channel_id in subscriptions
+        return subscriptions is not None and channel_id in subscriptions
     return False
 
 
@@ -297,11 +316,20 @@ def execute(
     now: datetime,
     subscriptions: Collection[str] | None = None,
 ) -> RunResult:
-    """Run videos through the graph. `subscriptions` is the resolved subscription channel set (None = all channels)."""
+    """Run videos through the graph.
+
+    `subscriptions` is the resolved subscription channel set; it is required (ValueError if None)
+    when the graph has a source.subscriptions node, so a forgotten set never files everything.
+    Reserved nodes (filter.llm, router.llm) fail fast: NotImplementedInThisVersion is raised before
+    any video is processed, even if the node is unreachable, because silently skipping an LLM
+    filter would misfile videos. A repeated video_id in `videos` is processed once.
+    """
     for nid in sorted(graph.nodes):
         n = graph.nodes[nid]
         if n.type in RESERVED_TYPES:
             raise NotImplementedInThisVersion(f"node {n.id!r} ({n.type}) is not implemented in this version")
+    if subscriptions is None and _has_subscriptions(graph):
+        raise ValueError("graph has a source.subscriptions node: pass the resolved subscriptions set")
     predicates: dict[str, Predicate] = {
         n.id: FILTERS[n.type].build(n.params) for n in graph.nodes.values() if n.type in FILTERS
     }
@@ -310,6 +338,8 @@ def execute(
     first = graph.multi_match == "first"
 
     for video in videos:
+        if video.video_id in result.traces:
+            continue
         trace: list[TraceEntry] = []
         files: list[str] = []
         done: set[str] = set()
@@ -318,31 +348,30 @@ def execute(
             trace.append(TraceEntry(nid, outcome, reason))
             result.node_counts[nid][outcome] += 1
 
-        def walk(nid: str) -> None:
-            if nid in done or (first and files):
-                return
-            done.add(nid)
-            node = graph.nodes[nid]
-            if node.type == "destination.playlist":
-                files.append(node.params.playlist_id)
-                record(nid, "file", f"filed to {node.params.playlist_id}")
-                return
-            if nid in predicates:
-                ok, reason = predicates[nid](video, now)
-                record(nid, "pass" if ok else "drop", reason)
-                if not ok:
-                    return
-            for t in graph.edges[nid]:
-                walk(t)
-
         for sid in sources:
             if first and files:
                 break
-            if _source_accepts(graph.nodes[sid], video.channel_id, subscriptions):
-                done.add(sid)
-                record(sid, "pass", f"channel {video.channel_id}")
-                for t in graph.edges[sid]:
-                    walk(t)
+            if not _source_accepts(graph.nodes[sid], video.channel_id, subscriptions):
+                continue
+            done.add(sid)
+            record(sid, "pass", f"channel {video.channel_id}")
+            stack = list(reversed(graph.edges[sid]))
+            while stack:
+                nid = stack.pop()
+                if nid in done or (first and files):
+                    continue
+                done.add(nid)
+                node = graph.nodes[nid]
+                if node.type == "destination.playlist":
+                    files.append(node.params.playlist_id)
+                    record(nid, "file", f"filed to {node.params.playlist_id}")
+                    continue
+                if nid in predicates:
+                    ok, reason = predicates[nid](video, now)
+                    record(nid, "pass" if ok else "drop", reason)
+                    if not ok:
+                        continue
+                stack.extend(reversed(graph.edges[nid]))
         result.traces[video.video_id] = trace
         for pid in dict.fromkeys(files):
             result.filings.append((video.video_id, pid))

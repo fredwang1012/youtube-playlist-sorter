@@ -1,14 +1,17 @@
 """Filter node parameter models and the per-video predicates they compile to."""
 import re
+import re._parser as sre_parse
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Literal
 
+import regex
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from app.detect import Video
 
 MAX_REGEX_TEXT = 5000
+REGEX_TIMEOUT = 0.1  # seconds per match; the `regex` package enforces it, `re` cannot
 
 Field = Literal["title", "description", "tags"]
 # A predicate returns (passed, reason).
@@ -47,6 +50,27 @@ class KeywordParams(Params):
         return self
 
 
+def _has_nested_unbounded_repeat(items, inside: bool = False) -> bool:
+    """True if an unbounded repeat (*, +, {n,}) contains another one, the classic catastrophic shape."""
+    for op, av in items:
+        if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+            unbounded = av[1] == sre_parse.MAXREPEAT
+            if unbounded and inside:
+                return True
+            if _has_nested_unbounded_repeat(av[2], inside or unbounded):
+                return True
+        elif op == sre_parse.SUBPATTERN:
+            if _has_nested_unbounded_repeat(av[3], inside):
+                return True
+        elif op == sre_parse.BRANCH:
+            if any(_has_nested_unbounded_repeat(b, inside) for b in av[1]):
+                return True
+        elif op in (sre_parse.ASSERT, sre_parse.ASSERT_NOT):
+            if _has_nested_unbounded_repeat(av[1], inside):
+                return True
+    return False
+
+
 class RegexParams(Params):
     pattern: str
     fields: list[Field] = ["title", "description"]
@@ -57,9 +81,15 @@ class RegexParams(Params):
     @classmethod
     def _compiles(cls, v: str) -> str:
         try:
-            re.compile(v)
-        except re.error as e:
+            regex.compile(v)
+        except regex.error as e:
             raise ValueError(f"invalid regex {v!r}: {e}") from e
+        try:
+            nested = _has_nested_unbounded_repeat(sre_parse.parse(v))
+        except (re.error, RecursionError, OverflowError):
+            nested = False  # syntax only the regex package understands; the runtime timeout still applies
+        if nested:
+            raise ValueError(f"regex {v!r} nests an unbounded repeat inside another (catastrophic backtracking risk)")
         return v
 
     @field_validator("fields")
@@ -157,12 +187,17 @@ def _keyword(p: KeywordParams) -> Predicate:
 
 
 def _regex(p: RegexParams) -> Predicate:
-    rx = re.compile(p.pattern, re.IGNORECASE if p.ignore_case else 0)
+    rx = regex.compile(p.pattern, regex.IGNORECASE if p.ignore_case else 0)
 
     def run(video: Video, now: datetime) -> tuple[bool, str]:
         matched = None
         for name in p.fields:
-            if rx.search(_field_text(video, name)[:MAX_REGEX_TEXT]):
+            try:
+                found = rx.search(_field_text(video, name)[:MAX_REGEX_TEXT], timeout=REGEX_TIMEOUT)
+            except TimeoutError:
+                # Fail closed (drop) even when negated, so a pathological title is never filed by accident.
+                return False, "regex timed out"
+            if found:
                 matched = name
                 break
         if p.negate:

@@ -1,7 +1,11 @@
 # EXAMPLE graph. All channel and playlist ids below are placeholders; replace them with your own.
 version: 1
 settings:
-  multi_match: all   # "all": file into every matching destination; "first": stop at the first
+  # "all": file into every matching destination.
+  # "first": stop at the first destination reached; edge targets are visited in lexicographic node-id order.
+  multi_match: all
+  # Reserved node types (filter.llm, router.llm) validate, but a graph containing one fails at run time
+  # with "not implemented in this version", even if the node is unreachable. Do not add them yet.
 nodes:
   - id: cooking_channels
     type: source.channel_group
