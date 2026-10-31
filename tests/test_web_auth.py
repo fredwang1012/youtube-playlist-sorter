@@ -305,3 +305,59 @@ def test_healthz_public_and_minimal(env):
     r = env.client.get("/healthz")
     assert (r.status_code, r.json()) == (200, {"ok": True})
     assert "set-cookie" not in r.headers
+
+
+def test_logout_revokes_copied_cookie(api, tmp_path):
+    copied = api.client.cookies.get("ytps_session")
+    other = make_env(tmp_path)  # a second device, signed in separately
+    with other.client as phone:
+        assert sign_in(phone).status_code == 302
+        # someone signed out cannot sign the owner out everywhere
+        with TestClient(api.client.app, base_url=PUBLIC) as stranger:
+            assert stranger.post("/auth/logout", json={}, headers=WRITE).status_code == 200
+        assert api.client.get("/api/me").status_code == 200
+        assert api.client.post("/auth/logout", json={}, headers=WRITE).status_code == 200
+        api.client.cookies.set("ytps_session", copied)
+        assert api.client.get("/api/me").status_code == 401
+        assert phone.get("/api/me").status_code == 401  # every device is signed out
+        api.client.cookies.clear()
+        assert sign_in(api.client).status_code == 302  # signing in again works under the new epoch
+        assert api.client.get("/api/me").status_code == 200
+
+
+def test_non_ascii_credentials_are_refused_not_500(web_settings, tmp_path, env):
+    env.client.get("/auth/login")
+    assert env.client.get("/auth/callback", params={"code": "c", "state": "\u00e9t\u00e9"}).status_code == 403
+    e = make_env(tmp_path, auth_mode="tailscale", owner_tailscale_login=OWNER_TS)
+    with e.client as c:
+        r = c.get("/api/me", headers={"Tailscale-User-Login": "fr\u00f6d@github".encode("utf-8")})
+        assert r.status_code == 403
+
+
+def test_every_non_get_api_route_is_write_guarded(api):
+    for method, path in API_ROUTES:
+        if method == "GET":
+            continue
+        r = api.client.request(method, path, json={}, headers={"Origin": "https://evil.example"})
+        assert (r.status_code, r.json()) == (403, {"error": "bad origin"}), (method, path)
+        r = api.client.request(method, path, content=b"{}", headers={**WRITE, "Content-Type": "text/plain"})
+        assert r.status_code == 403, (method, path)
+
+
+def test_google_mode_needs_owner_email(web_settings, monkeypatch):
+    monkeypatch.setattr(settings, "owner_email", "")
+    with pytest.raises(ValueError, match="OWNER_EMAIL"):
+        create_app(settings, Deps())
+
+
+@pytest.mark.parametrize("site, status", [(None, 200), ("same-origin", 200), ("same-site", 403), ("cross-site", 403)])
+def test_api_refuses_cross_site_fetches(web_settings, tmp_path, site, status):
+    e = make_env(tmp_path, auth_mode="tailscale", owner_tailscale_login=OWNER_TS)
+    headers = {"Tailscale-User-Login": OWNER_TS, **({"Sec-Fetch-Site": site} if site else {})}
+    with e.client as c:
+        assert c.get("/api/activity", headers=headers).status_code == status
+        assert c.get("/healthz", headers=headers).status_code == 200
+
+
+def test_google_mode_refuses_cross_site_fetches_too(api):
+    assert api.client.get("/api/me", headers={"Sec-Fetch-Site": "cross-site"}).status_code == 403

@@ -19,13 +19,14 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = [
-    "httpx2>=2.16.0",
-    "pytest>=8",
-]
+dev = ["pytest>=8"]
 
 [tool.uv]
 package = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Starlette's TestClient asks for the httpx2 fork; tests keep httpx until that fork has been vetted
+filterwarnings = [
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]

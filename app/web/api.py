@@ -1,4 +1,4 @@
-"""JSON API for the web UI. Every route needs the owner; POST and PUT also pass the JSON-and-Origin check.
+"""JSON API for the web UI. Every route needs the owner; every non-GET route also passes the JSON-and-Origin check.
 
 Handlers are plain functions, so FastAPI runs them in its threadpool. Each opens its own State (SQLite connections
 stay on one thread) and charges the YouTube units it spends to today's quota log.
@@ -36,14 +36,15 @@ def owner(request: Request) -> str:
     return request.app.state.auth.owner(request)
 
 
-def owner_write(request: Request, email: str = Depends(owner)) -> str:
-    request.app.state.auth.check_write(request)
-    return email
+def write_guard(request: Request, _: str = Depends(owner)) -> None:
+    """Every method other than GET/HEAD must pass the JSON-and-Origin check, after the owner check."""
+    if request.method not in ("GET", "HEAD"):
+        request.app.state.auth.check_write(request)
 
 
 def json_body(model: type[BaseModel]):
     """Dependency parsing the body as `model`, only after the owner and write checks have passed."""
-    async def parse(request: Request, _: str = Depends(owner_write)) -> BaseModel:
+    async def parse(request: Request, _: None = Depends(write_guard)) -> BaseModel:
         try:
             return model.model_validate(await request.json())
         except (ValueError, ValidationError):  # ValidationError is a ValueError; listed for the reader
@@ -83,7 +84,8 @@ def _write_atomic(path: Path, text: str) -> None:
 
 
 def build_router(cfg: Settings, deps: "Deps") -> APIRouter:
-    router = APIRouter(prefix="/api", dependencies=[Depends(owner)])
+    router = APIRouter(prefix="/api", dependencies=[Depends(owner), Depends(write_guard)])
+    # threadpool handlers share this; a race only costs an extra 1-unit fetch, and dict get/set are atomic in CPython
     playlists_cache: dict[str, tuple[datetime, dict[str, str]]] = {}
 
     @contextmanager
@@ -183,7 +185,7 @@ def build_router(cfg: Settings, deps: "Deps") -> APIRouter:
                 return JSONResponse({"error": str(err)}, 422)
         return {"queue_playlist": body.playlist_id}
 
-    @router.post("/run", status_code=202, dependencies=[Depends(owner_write)])
+    @router.post("/run", status_code=202)
     def start_run() -> dict:
         status = jobs.start_background("manual", make_client=deps.make_client, settings=cfg)
         return {"status": status}

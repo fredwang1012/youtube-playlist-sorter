@@ -2,7 +2,8 @@
 
 The tailnet is shared with another account, so reaching the server proves nothing. Google mode accepts only a
 verified owner_email; Tailscale mode accepts only Tailscale-User-Login == owner_tailscale_login. Sessions are a signed
-cookie holding the email and the sign-in time; there is no server-side session store.
+cookie holding the email, the sign-in time and the session epoch; logout bumps the epoch in State, which signs out
+every device. Tailscale mode has no sessions: each request carries the identity header, so there is nothing to revoke.
 """
 import base64
 import hashlib
@@ -23,6 +24,7 @@ from itsdangerous import BadSignature, URLSafeSerializer
 
 from app import secretstore
 from app.config import Settings
+from app.state import State
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +37,7 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 TAILSCALE_LOGIN_HEADER = "Tailscale-User-Login"
 LOGIN_CLIENT_SECRET = "login-client-secret"
 SESSION_KEY = "session-key"
+EPOCH_KEY = "session_epoch"  # State kv; a session signed under an older epoch is refused
 
 REFUSED_PAGE = (
     "<!doctype html><meta charset=utf-8><title>Sign-in refused</title>"
@@ -69,6 +72,11 @@ def _session_key() -> str:
     return key
 
 
+def _same(a: str, b: str) -> bool:
+    # compare_digest raises TypeError on non-ASCII str, so compare the UTF-8 bytes
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
 def _challenge(verifier: str) -> str:
     return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
 
@@ -82,9 +90,27 @@ class Auth:
 
     def __post_init__(self) -> None:
         if self.cfg.auth_mode == "google":
+            if not self.cfg.owner_email.strip():
+                raise ValueError("OWNER_EMAIL must be set for Google sign-in.")
             key = _session_key()
             self._sessions = URLSafeSerializer(key, salt="ytps-session")
             self._oauth = URLSafeSerializer(key, salt="ytps-oauth")
+
+    def _epoch(self) -> int:
+        state = State(self.cfg.data_dir / "state.db")
+        try:
+            row = state.kv_get(EPOCH_KEY)
+        finally:
+            state.close()
+        return int(row[0]) if row else 0
+
+    def _bump_epoch(self) -> None:
+        state = State(self.cfg.data_dir / "state.db")
+        try:
+            row = state.kv_get(EPOCH_KEY)
+            state.kv_set(EPOCH_KEY, str((int(row[0]) if row else 0) + 1), self.now())
+        finally:
+            state.close()
 
     @property
     def redirect_uri(self) -> str:
@@ -111,16 +137,21 @@ class Auth:
 
     def owner(self, request: Request) -> str:
         """The owner's identity, or NotSignedIn / Forbidden."""
+        # a browser marks requests from other sites; refusing them for the API stops a page elsewhere spending quota
+        if request.url.path.startswith("/api") and request.headers.get("sec-fetch-site", "same-origin") != "same-origin":
+            raise Forbidden("cross-site request")
         if self.cfg.auth_mode == "tailscale":
             login = request.headers.get(TAILSCALE_LOGIN_HEADER, "")
             if not login:
                 raise NotSignedIn()
-            if not self.cfg.owner_tailscale_login or not hmac.compare_digest(login, self.cfg.owner_tailscale_login):
+            if not self.cfg.owner_tailscale_login or not _same(login, self.cfg.owner_tailscale_login):
                 raise Forbidden("not the owner")
             return login
         data = self._signed(self._sessions, request.cookies.get(SESSION_COOKIE), SESSION_MAX_AGE)
         email = data.get("email") if data else None
         if not isinstance(email, str) or email.casefold() != self.cfg.owner_email.casefold():
+            raise NotSignedIn()
+        if data.get("ep") != self._epoch():
             raise NotSignedIn()
         return email
 
@@ -167,7 +198,7 @@ class Auth:
                 response: Response = HTMLResponse(REFUSED_PAGE, 403)
             else:
                 response = RedirectResponse("/", 302)
-                session = self._sessions.dumps({"email": email, "iat": int(self.now().timestamp())})
+                session = self._sessions.dumps({"email": email, "iat": int(self.now().timestamp()), "ep": self._epoch()})
                 self._cookie(response, SESSION_COOKIE, session, SESSION_MAX_AGE, "/")
             response.delete_cookie(OAUTH_COOKIE, path="/auth", httponly=True, secure=True, samesite="lax")
             return response
@@ -175,6 +206,13 @@ class Auth:
         @router.post("/logout")
         def logout(request: Request) -> Response:
             self.check_write(request)
+            if self.cfg.auth_mode == "google":
+                try:
+                    self.owner(request)
+                except NotSignedIn:
+                    pass  # only the owner may sign out every device; anyone may drop their own cookie
+                else:
+                    self._bump_epoch()
             response = JSONResponse({"ok": True})
             response.delete_cookie(SESSION_COOKIE, path="/", httponly=True, secure=True, samesite="lax")
             return response
@@ -187,7 +225,7 @@ class Auth:
         pending = self._signed(self._oauth, cookie, OAUTH_MAX_AGE)
         if pending is None:
             raise LoginRefused("login cookie missing, forged or expired")
-        if not state or not hmac.compare_digest(state, str(pending.get("state", ""))):
+        if not state or not _same(state, str(pending.get("state", ""))):
             raise LoginRefused("state mismatch")
         if not code:
             raise LoginRefused("no authorization code")
