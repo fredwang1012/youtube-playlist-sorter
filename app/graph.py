@@ -133,7 +133,7 @@ def parse_graph(data: Any) -> Graph:
         if nid in nodes:
             errors.append(f"node {nid!r}: duplicate id")
             continue
-        for key in sorted(set(raw) - {"id", "type", "params"}, key=str):
+        for key in sorted(set(raw) - {"id", "type", "params", "ui"}, key=str):  # ui: editor positions, ignored
             errors.append(f"node {nid!r}: unknown key {key!r}")
         model = PARAM_MODELS.get(ntype) if isinstance(ntype, str) else None
         if model is None:

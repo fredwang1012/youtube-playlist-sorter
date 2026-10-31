@@ -368,3 +368,11 @@ def test_reserved_types_validate_but_raise():
             execute(g, [], NOW)
     assert "'brain'" in errors_of({"version": 1, "nodes": [src(), filt("brain", "filter.llm"), dest()],
                                    "edges": [{"from": "s", "to": "brain"}, {"from": "brain", "to": "d"}]})
+
+
+def test_node_ui_key_is_allowed_and_ignored():
+    # the web editor stores node positions under "ui"; other unknown node keys are still rejected
+    g = graph([{**src(), "ui": {"x": 10, "y": 20}}, {**dest(), "ui": {"x": 300, "y": 20}}], [{"from": "s", "to": "d"}])
+    assert g.nodes["s"] == graph([src(), dest()], [{"from": "s", "to": "d"}]).nodes["s"]
+    msg = errors_of({"version": 1, "nodes": [{**src(), "pos": {}}, dest()], "edges": [{"from": "s", "to": "d"}]})
+    assert "unknown key 'pos'" in msg

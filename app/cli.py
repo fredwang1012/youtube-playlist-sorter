@@ -1,4 +1,4 @@
-"""Command line entry: python -m app.cli <auth|whoami|playlists|channels|run|preview>."""
+"""Command line entry: python -m app.cli <auth|whoami|playlists|channels|run|preview|serve>."""
 import argparse
 import sys
 from datetime import datetime, timezone
@@ -112,9 +112,20 @@ def cmd_preview(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve(_: argparse.Namespace) -> int:
+    # imported here so the other commands do not load the web stack
+    import uvicorn
+
+    from app.web.server import create_app
+
+    # loopback only: tailscale serve publishes it to the tailnet. No access log: callback URLs carry sign-in codes.
+    uvicorn.run(create_app(settings), host="127.0.0.1", port=settings.bind_port, access_log=False)
+    return 0
+
+
 COMMANDS = {
     "auth": cmd_auth, "whoami": cmd_whoami, "playlists": cmd_playlists, "channels": cmd_channels,
-    "run": cmd_run, "preview": cmd_preview,
+    "run": cmd_run, "preview": cmd_preview, "serve": cmd_serve,
 }
 AUTH_EXPIRED = (
     "Google sign-in expired or was revoked - run: py -3.12 -m uv run python -m app.cli auth "
