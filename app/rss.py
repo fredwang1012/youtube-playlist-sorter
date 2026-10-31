@@ -9,6 +9,7 @@ from typing import Callable
 FEED_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 USER_AGENT = "youtube-playlist-sorter/0.1 (+https://github.com/fredwang1012/youtube-playlist-sorter)"
 TIMEOUT_SECONDS = 15
+MAX_BYTES = 2_000_000
 FEED_SIZE = 15  # YouTube returns at most this many entries
 
 NS = {
@@ -35,9 +36,12 @@ def fetch_url(url: str) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
-            return resp.read()
+            data = resp.read(MAX_BYTES + 1)
     except OSError as err:  # URLError and timeouts are OSError subclasses
         raise RssError(f"Could not fetch feed: {err}") from None
+    if len(data) > MAX_BYTES:
+        raise RssError("Feed response is too large.")
+    return data
 
 
 def parse_feed(xml: bytes) -> list[FeedEntry]:

@@ -8,7 +8,7 @@ from app import detect, rss
 from app.config import settings
 from app.detect import detect_new, parse_duration
 from app.state import State
-from app.youtube import QuotaMeter, RealYouTube
+from app.youtube import ForbiddenError, NotFoundError, QuotaExceededError, QuotaMeter, RateLimitedError, RealYouTube
 from tests.test_auth import FakeService
 
 FIXTURE = Path(__file__).parent / "fixtures" / "channel_feed.xml"
@@ -113,8 +113,10 @@ def test_fetch_url_sets_user_agent_and_timeout(monkeypatch):
         def __exit__(self, *args):
             return False
 
-        def read(self):
-            return b"ok"
+        def read(self, n=-1):
+            return self.body[:n] if n >= 0 else self.body
+
+        body = b"ok"
 
     def fake_urlopen(req, timeout):
         seen["ua"], seen["timeout"] = req.get_header("User-agent"), timeout
@@ -124,6 +126,24 @@ def test_fetch_url_sets_user_agent_and_timeout(monkeypatch):
     assert rss.fetch_url("https://example.invalid/feed") == b"ok"
     assert seen == {"ua": rss.USER_AGENT, "timeout": 15}
     assert "@" not in rss.USER_AGENT.replace("youtube-playlist-sorter", "")
+
+
+def test_fetch_url_rejects_oversized_response(monkeypatch):
+    class Resp:
+        body = b"x" * (rss.MAX_BYTES + 1)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, n=-1):
+            return self.body[:n]
+
+    monkeypatch.setattr(rss.urllib.request, "urlopen", lambda req, timeout: Resp())
+    with pytest.raises(rss.RssError, match="too large"):
+        rss.fetch_url("https://example.invalid/feed")
 
 
 def test_fetch_url_network_error_becomes_rss_error(monkeypatch):
@@ -143,6 +163,13 @@ def test_fetch_url_network_error_becomes_rss_error(monkeypatch):
 ])
 def test_parse_duration(iso, seconds):
     assert parse_duration(iso) == seconds
+
+
+def test_unknown_duration_is_not_a_short():
+    item = video_item("v")
+    del item["contentDetails"]
+    assert detect.to_video(item).is_short is False
+    assert detect.to_video(video_item("v", duration="garbage")).is_short is False
 
 
 @pytest.mark.parametrize("duration,live,short", [
@@ -298,3 +325,72 @@ def test_empty_feed_still_marks_channel_known(state):
     assert state.channel_known(CH)
     out = run(state, FakeYT(), {CH: feed_xml(CH, ["first-upload"])})
     assert [v.video_id for v in out.videos] == ["first-upload"]
+
+
+# --- per-channel failures, dropped and duplicate ids ---
+
+class FailingYT(FakeYT):
+    def __init__(self, failing, exc, **kw):
+        super().__init__(**kw)
+        self.failing, self.exc = failing, exc
+
+    def channels_uploads_playlist(self, channel_id):
+        if channel_id in self.failing:
+            raise self.exc("boom")
+        return super().channels_uploads_playlist(channel_id)
+
+
+def three_known_channels(state):
+    chans = ["UCaaa", "UCbbb", "UCccc"]
+    for c in chans:
+        state.mark_channel_known(c, NOW)
+    return chans
+
+
+def test_not_found_channel_does_not_abort_others(state):
+    a, b, c = three_known_channels(state)
+    feeds = {a: feed_xml(a, ["a1"]), b: rss.RssError("down"), c: feed_xml(c, ["c1"])}
+    out = run(state, FailingYT({b}, NotFoundError), feeds)
+    assert sorted(v.video_id for v in out.videos) == ["a1", "c1"]
+    assert out.errors == [(b, "NotFoundError")]
+
+
+def test_forbidden_channel_is_recorded(state):
+    a, b, _ = three_known_channels(state)
+    out = run(state, FailingYT({b}, ForbiddenError), {b: rss.RssError("down"), a: feed_xml(a, ["a1"])})
+    assert [v.video_id for v in out.videos] == ["a1"]
+    assert out.errors == [(b, "ForbiddenError")]
+
+
+@pytest.mark.parametrize("exc", [QuotaExceededError, RateLimitedError])
+def test_quota_and_rate_errors_propagate(state, exc):
+    a, b, _ = three_known_channels(state)
+    with pytest.raises(exc):
+        run(state, FailingYT({b}, exc), {a: feed_xml(a, ["a1"]), b: rss.RssError("down")})
+
+
+def test_rss_failure_on_first_run_is_handled(state):
+    yt = FakeYT(uploads={UPLOADS: ["x1", "x2"]})
+    out = run(state, yt, {CH: rss.RssError("down")})
+    assert out.videos == [] and out.fallback_channels == [CH] and out.errors == []
+    assert state.seen(["x1", "x2"]) == {"x1", "x2"} and state.channel_known(CH)
+    dead = run(state, FailingYT({"UCzzz"}, NotFoundError), {"UCzzz": rss.RssError("down")})
+    assert dead.errors == [("UCzzz", "NotFoundError")] and not state.channel_known("UCzzz")
+
+
+def test_dropped_videos_are_marked_seen_and_reported(state):
+    state.mark_channel_known(CH, NOW)
+    out = run(state, FakeYT(), {CH: feed_xml(CH, ["gone1", "ok1"])})
+    assert out.dropped == ["gone1"]
+    assert state.seen(["gone1", "ok1"]) == {"gone1"}
+    again = FakeYT()
+    assert run(state, again, {CH: feed_xml(CH, ["gone1"])}).videos == []
+    assert again.calls == []  # not requested again
+
+
+def test_same_id_in_two_feeds_is_enriched_once(state):
+    a, b, _ = three_known_channels(state)
+    yt = FakeYT()
+    out = run(state, yt, {a: feed_xml(a, ["dup", "a1"]), b: feed_xml(b, ["dup"])})
+    assert [v.video_id for v in out.videos] == ["dup", "a1"]
+    assert [c[1] for c in yt.calls if c[0] == "videos"] == [["dup", "a1"]]

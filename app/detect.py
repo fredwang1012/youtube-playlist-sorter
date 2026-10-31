@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 from app.rss import FEED_SIZE, FeedEntry, Fetcher, RssError, fetch_feed, fetch_url
 from app.state import State
-from app.youtube import YouTubeAPI
+from app.youtube import ForbiddenError, NotFoundError, YouTubeAPI
 
 SHORT_MAX_SECONDS = 180
 FALLBACK_MAX_ITEMS = 50
@@ -42,6 +42,8 @@ class Video:
 class Detection:
     videos: list[Video] = field(default_factory=list)
     fallback_channels: list[str] = field(default_factory=list)  # channels read via the uploads playlist
+    errors: list[tuple[str, str]] = field(default_factory=list)  # (channel_id, error class) for skipped channels
+    dropped: list[str] = field(default_factory=list)  # ids missing from videos.list; already marked seen
 
 
 def to_video(item: dict[str, Any]) -> Video:
@@ -58,7 +60,7 @@ def to_video(item: dict[str, Any]) -> Video:
         live_broadcast_content=live,
         published_at=datetime.fromisoformat(sn["publishedAt"]),
         duration_seconds=seconds,
-        is_short=seconds <= SHORT_MAX_SECONDS and live == "none",
+        is_short=0 < seconds <= SHORT_MAX_SECONDS and live == "none",
     )
 
 
@@ -84,35 +86,56 @@ def detect_new(
     """Unseen, enriched uploads for the channels.
 
     A channel's first run marks its current items as seen (no flood) and returns only the newest `backfill`.
-    Returned videos are not marked seen: the caller marks them once they are handled.
+    Returned videos are not marked seen: the caller marks them once they are handled. Videos that videos.list no
+    longer returns (private/deleted) are marked seen here and listed in `dropped`. A channel that is not found or
+    forbidden is recorded in `errors`; quota and rate-limit errors propagate.
     """
     result = Detection()
     pending: list[FeedEntry] = []
     for ch in channel_ids:
-        via_playlist = False
         try:
-            entries = fetch_feed(ch, fetch)
-        except RssError:
-            entries, via_playlist = _playlist_entries(yt, ch, fallback_max_items), True
-        first_run = not state.channel_known(ch)
-        # a full feed where nothing is known suggests more than FEED_SIZE uploads since the last run
-        if not first_run and not via_playlist and len(entries) >= FEED_SIZE and not state.seen([e.video_id for e in entries]):
-            entries, via_playlist = _playlist_entries(yt, ch, fallback_max_items), True
+            fresh, via_playlist = _channel_fresh(ch, yt, state, now, fetch, backfill, fallback_max_items)
+        except (NotFoundError, ForbiddenError) as err:
+            # one dead or terminated channel must not stop the others; quota and rate errors still propagate
+            result.errors.append((ch, type(err).__name__))
+            continue
         if via_playlist:
             result.fallback_channels.append(ch)
-
-        seen = state.seen([e.video_id for e in entries])
-        fresh = [e for e in entries if e.video_id not in seen]
-        if first_run:
-            fresh.sort(key=lambda e: e.published, reverse=True)
-            for e in fresh[backfill:]:
-                state.mark_seen(e.video_id, ch, now())
-            fresh = fresh[:backfill]
-            state.mark_channel_known(ch, now())
         pending.extend(fresh)
 
     if pending:
-        by_id = {v["id"]: v for v in yt.videos([e.video_id for e in pending])}  # batched at 50 by the wrapper
-        # videos that went private or were deleted come back missing and are dropped
-        result.videos = [to_video(by_id[e.video_id]) for e in pending if e.video_id in by_id]
+        unique = list(dict.fromkeys(e.video_id for e in pending))  # the same video can appear in two feeds
+        by_id = {v["id"]: v for v in yt.videos(unique)}  # batched at 50 by the wrapper
+        channel_of = {e.video_id: e.channel_id for e in pending}
+        for vid in unique:
+            if vid not in by_id:
+                # private or deleted since upload: mark seen here so it is not re-requested every run
+                result.dropped.append(vid)
+                state.mark_seen(vid, channel_of[vid], now())
+        result.videos = [to_video(by_id[vid]) for vid in unique if vid in by_id]
     return result
+
+
+def _channel_fresh(
+    ch: str, yt: YouTubeAPI, state: State, now: Callable[[], datetime], fetch: Fetcher, backfill: int, fallback_max: int
+) -> tuple[list[FeedEntry], bool]:
+    """Unseen entries for one channel and whether the uploads playlist was needed."""
+    via_playlist = False
+    try:
+        entries = fetch_feed(ch, fetch)
+    except RssError:
+        entries, via_playlist = _playlist_entries(yt, ch, fallback_max), True
+    first_run = not state.channel_known(ch)
+    # a full feed where nothing is known suggests more than FEED_SIZE uploads since the last run
+    if not first_run and not via_playlist and len(entries) >= FEED_SIZE and not state.seen([e.video_id for e in entries]):
+        entries, via_playlist = _playlist_entries(yt, ch, fallback_max), True
+
+    seen = state.seen([e.video_id for e in entries])
+    fresh = [e for e in entries if e.video_id not in seen]
+    if first_run:
+        fresh.sort(key=lambda e: e.published, reverse=True)
+        for e in fresh[backfill:]:
+            state.mark_seen(e.video_id, ch, now())
+        fresh = fresh[:backfill]
+        state.mark_channel_known(ch, now())
+    return fresh, via_playlist
