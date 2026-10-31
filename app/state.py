@@ -14,6 +14,9 @@ CREATE TABLE IF NOT EXISTS filed (
     video_id TEXT NOT NULL, playlist_id TEXT NOT NULL, at TEXT NOT NULL,
     UNIQUE (video_id, playlist_id));
 CREATE TABLE IF NOT EXISTS quota_log (day TEXT PRIMARY KEY, units INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS attempts (
+    video_id TEXT PRIMARY KEY, failures INTEGER NOT NULL, gave_up INTEGER NOT NULL DEFAULT 0, last_error TEXT);
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, finished_at TEXT, summary TEXT);
 """
@@ -25,6 +28,21 @@ class State:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(path)
         self._db.executescript(SCHEMA)
+
+    @classmethod
+    def throwaway_copy(cls, path: Path | None = None) -> "State":
+        """In-memory copy of the state file (empty if there is none); writes never reach disk. Used by dry-run."""
+        path = path or settings.data_dir / "state.db"
+        self = cls.__new__(cls)
+        self._db = sqlite3.connect(":memory:")
+        if path.is_file():
+            disk = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+            try:
+                disk.backup(self._db)
+            finally:
+                disk.close()
+        self._db.executescript(SCHEMA)  # a pre-existing file may predate newer tables; this is in memory only
+        return self
 
     def close(self) -> None:
         self._db.close()
@@ -92,3 +110,36 @@ class State:
                 "UPDATE runs SET finished_at = ?, summary = ? WHERE id = ?",
                 (now.isoformat(), json.dumps(summary), run_id),
             )
+
+    def kv_get(self, key: str) -> tuple[str, datetime] | None:
+        row = self._db.execute("SELECT value, at FROM kv WHERE key = ?", (key,)).fetchone()
+        return (row[0], datetime.fromisoformat(row[1])) if row else None
+
+    def kv_set(self, key: str, value: str, now: datetime) -> None:
+        with self._db:
+            self._db.execute(
+                "INSERT INTO kv (key, value, at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = excluded.at",
+                (key, value, now.isoformat()),
+            )
+
+    def failures(self, video_id: str) -> int:
+        row = self._db.execute("SELECT failures FROM attempts WHERE video_id = ?", (video_id,)).fetchone()
+        return row[0] if row else 0
+
+    def record_failure(self, video_id: str, error: str, give_up_after: int) -> bool:
+        """Count one failed run for the video; True if it has now reached the cap and is given up."""
+        n = self.failures(video_id) + 1
+        gave_up = n >= give_up_after
+        with self._db:
+            self._db.execute(
+                "INSERT INTO attempts (video_id, failures, gave_up, last_error) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(video_id) DO UPDATE SET failures = excluded.failures, gave_up = excluded.gave_up, "
+                "last_error = excluded.last_error",
+                (video_id, n, int(gave_up), error),
+            )
+        return gave_up
+
+    def gave_up(self) -> list[tuple[str, str]]:
+        rows = self._db.execute("SELECT video_id, last_error FROM attempts WHERE gave_up = 1 ORDER BY video_id")
+        return [(r[0], r[1] or "") for r in rows]

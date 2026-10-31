@@ -30,6 +30,14 @@ class NotFoundError(YouTubeError):
     pass
 
 
+class AlreadyInPlaylistError(YouTubeError):
+    pass
+
+
+class PlaylistFullError(YouTubeError):
+    pass
+
+
 class QuotaMeter:
     """Counts quota units spent, in total and per kind of call."""
 
@@ -66,6 +74,10 @@ def _map_error(err: HttpError, what: str) -> YouTubeError:
         return QuotaExceededError(f"YouTube quota exceeded during {what}. It resets at midnight Pacific time.")
     if reason in ("rateLimitExceeded", "userRateLimitExceeded"):
         return RateLimitedError(f"YouTube rate limit hit during {what}; wait a bit and retry.")
+    if reason == "videoAlreadyInPlaylist":
+        return AlreadyInPlaylistError(f"Video is already in the playlist ({what}).")
+    if reason == "playlistContainsMaximumNumberOfVideos":
+        return PlaylistFullError(f"Playlist is full ({what}).")
     if status == 404 or reason in ("notFound", "playlistNotFound", "channelNotFound", "videoNotFound"):
         return NotFoundError(f"Not found during {what}.")
     if status == 403:

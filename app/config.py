@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     # lives outside the repo so the secret can never be committed
     client_secret_path: Path = Path("~/.config/youtube-playlist-sorter/client_secret.json")
     daily_quota_budget: int = 8000
+    allow_any_playlist: bool = False
     timezone: str = "America/Toronto"
 
     @field_validator("data_dir")

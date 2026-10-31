@@ -20,6 +20,10 @@ class AuthError(Exception):
     """A problem the user can fix; the message says how and never contains a token."""
 
 
+class AuthExpiredError(AuthError):
+    """The refresh token was rejected: expired (7 days in Testing mode) or revoked."""
+
+
 def _read_client_config(path: Path | None = None) -> dict:
     path = path or settings.client_secret_path
     if not path.is_file():
@@ -63,5 +67,5 @@ def load_credentials() -> Credentials:
     try:
         creds.refresh(Request())
     except RefreshError:
-        raise AuthError("Google rejected the stored token (revoked or expired). Re-run: python -m app.cli auth") from None
+        raise AuthExpiredError("Google rejected the stored token (revoked or expired). Re-run: python -m app.cli auth") from None
     return creds

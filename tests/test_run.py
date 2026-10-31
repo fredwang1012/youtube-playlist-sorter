@@ -1,0 +1,354 @@
+"""Run command: detection -> graph -> inserts with the quota guard, against a fake YouTube client."""
+import json
+from datetime import datetime, timezone
+
+import pytest
+
+from app import auth, cli, run as runner
+from app.config import settings
+from app.graph import parse_graph
+from app.state import State
+from app.youtube import (
+    INSERT_COST,
+    AlreadyInPlaylistError,
+    PlaylistFullError,
+    QuotaExceededError,
+    QuotaMeter,
+    RateLimitedError,
+    YouTubeError,
+    _map_error,
+)
+from tests.test_auth import http_error
+from tests.test_detect import CH, feed_xml, video_item
+
+NOW = datetime(2026, 10, 30, 9, 0, tzinfo=timezone.utc)  # 02:00 Pacific, same day
+DAY = "2026-10-30"
+PL1 = "PLaaaaaaaaaa1"
+PL2 = "PLaaaaaaaaaa2"
+OTHER = "PLzzzzzzzzzz9"
+
+
+class FakeYT:
+    def __init__(self, owned=(PL1, PL2), subs=()):
+        self.meter = QuotaMeter()
+        self.owned = list(owned)
+        self.subs = list(subs)
+        self.inserts = []
+        self.insert_errors = {}  # (playlist, video) -> exceptions to raise in turn
+        self.calls = []
+
+    def _read(self, name):
+        self.calls.append(name)
+        self.meter.record(name, 1)
+
+    def my_playlists(self):
+        self._read("playlists")
+        return [{"id": p, "snippet": {"title": f"Title {p}"}} for p in self.owned]
+
+    def subscriptions(self):
+        self._read("subscriptions")
+        return [{"snippet": {"resourceId": {"channelId": c}}} for c in self.subs]
+
+    def videos(self, ids):
+        self._read("videos")
+        return [video_item(v) for v in ids]
+
+    def insert_into_playlist(self, playlist_id, video_id):
+        self.calls.append("insert")
+        self.meter.record("insert", INSERT_COST)
+        errs = self.insert_errors.get((playlist_id, video_id))
+        if errs:
+            raise errs.pop(0)
+        self.inserts.append((playlist_id, video_id))
+
+
+def graph(*playlists):
+    playlists = playlists or (PL1,)
+    nodes = [{"id": "s", "type": "source.channel", "params": {"channel_id": CH}}]
+    edges = []
+    for i, pl in enumerate(playlists):
+        nodes.append({"id": f"d{i}", "type": "destination.playlist", "params": {"playlist_id": pl}})
+        edges.append({"from": "s", "to": f"d{i}"})
+    return parse_graph({"version": 1, "nodes": nodes, "edges": edges})
+
+
+def keyword_graph(term):
+    return parse_graph({"version": 1, "nodes": [
+        {"id": "s", "type": "source.channel", "params": {"channel_id": CH}},
+        {"id": "kw", "type": "filter.keyword", "params": {"include": [term], "fields": ["title"]}},
+        {"id": "d", "type": "destination.playlist", "params": {"playlist_id": PL1}}],
+        "edges": [{"from": "s", "to": "kw"}, {"from": "kw", "to": "d"}]})
+
+
+def fetcher(ids):
+    return lambda url: feed_xml(CH, ids)
+
+
+@pytest.fixture
+def state():
+    s = State()
+    s.mark_channel_known(CH, NOW)  # not a first run: every feed entry is new
+    yield s
+    s.close()
+
+
+def go(g, yt, state, ids, budget=8000, **kw):
+    kw.setdefault("sleep", lambda _s: None)
+    return runner.run(g, yt, state, yt.meter, NOW, budget, fetch=fetcher(ids), **kw)
+
+
+def fresh_meter(yt):
+    yt.meter = QuotaMeter()
+
+
+def test_files_new_videos_and_records_state(state):
+    yt = FakeYT()
+    r = go(graph(), yt, state, ["v1", "v2"])
+    assert yt.inserts == [(PL1, "v1"), (PL1, "v2")]
+    assert r.new_videos == 2 and r.filed[PL1] == 2
+    assert state.is_filed("v1", PL1) and state.seen(["v1", "v2"]) == {"v1", "v2"}
+    assert state.quota_used(DAY) == yt.meter.total == 2 + 2 * INSERT_COST  # playlists + videos + inserts
+    out = runner.render(r)
+    assert "Title PLaaaaaaaaaa1: 2" in out and f"{yt.meter.total} used today / budget 8000" in out
+
+
+def test_no_duplicate_inserts_across_runs(state):
+    yt = FakeYT()
+    go(graph(), yt, state, ["v1", "v2"])
+    fresh_meter(yt)
+    r = go(graph(), yt, state, ["v1", "v2"])
+    assert len(yt.inserts) == 2 and r.new_videos == 0
+    # a recorded filing is never inserted again even if the video shows up unseen
+    state.mark_filed("v3", PL1, NOW)
+    go(graph(), yt, state, ["v1", "v2", "v3"])
+    assert len(yt.inserts) == 2
+
+
+def test_already_filed_but_unseen_is_skipped(state):
+    yt = FakeYT()
+    state.mark_filed("v1", PL1, NOW)
+    r = go(graph(), yt, state, ["v1"])
+    assert yt.inserts == [] and r.already == 1 and state.seen(["v1"]) == {"v1"}
+
+
+def test_already_in_playlist_on_youtube_marks_filed(state):
+    yt = FakeYT()
+    yt.insert_errors[(PL1, "v1")] = [AlreadyInPlaylistError("dup")]
+    r = go(graph(), yt, state, ["v1"])
+    assert state.is_filed("v1", PL1) and state.seen(["v1"]) == {"v1"} and r.errors == []
+
+
+def test_dry_run_writes_nothing(state):
+    yt = FakeYT()
+    snap = State.throwaway_copy()
+    r = go(graph(), yt, snap, ["v1", "v2"], dry_run=True)
+    snap.close()
+    assert yt.inserts == [] and "insert" not in yt.calls
+    assert state.quota_used(DAY) == 0 and state.seen(["v1", "v2"]) == set() and not state.is_filed("v1", PL1)
+    assert state._db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+    assert r.projected[PL1] == 2
+    out = runner.render(r)
+    assert "DRY RUN" in out and "Title PLaaaaaaaaaa1: 2" in out and "still costs quota" in out
+    assert f"{2 + 2 * INSERT_COST} units for a real run" in out
+    assert "s: pass 2" in out and "pass: title v1" in out
+
+
+def test_dry_run_with_no_state_file_creates_nothing():
+    State.throwaway_copy().close()
+    assert not (settings.data_dir / "state.db").exists()
+
+
+def test_dry_run_reports_drops_and_at_most_three_examples():
+    snap = State.throwaway_copy()
+    snap.mark_channel_known(CH, NOW)
+    r = go(keyword_graph("v1"), FakeYT(), snap, ["v1", "v2", "v3", "v4", "v5"], dry_run=True)
+    out = runner.render(r).splitlines()
+    assert "  kw: drop 4, pass 1" in out
+    block = out[out.index("  kw: drop 4, pass 1") + 1:]
+    examples = []
+    for line in block:
+        if not line.startswith("      "):
+            break
+        examples.append(line)
+    assert examples == ["      pass: title v1", "      drop: title v2", "      drop: title v3"]
+
+
+def test_budget_stop_and_carry_over(state):
+    yt = FakeYT()
+    r = go(graph(), yt, state, ["v1", "v2", "v3"], budget=2 + 2 * INSERT_COST)  # 2 reads + two inserts
+    assert yt.inserts == [(PL1, "v1"), (PL1, "v2")] and r.deferred == 1
+    assert state.seen(["v1", "v2", "v3"]) == {"v1", "v2"}
+    assert "Deferred to the next run: 1" in runner.render(r)
+    fresh_meter(yt)
+    r = go(graph(), yt, state, ["v1", "v2", "v3"])
+    assert yt.inserts == [(PL1, "v1"), (PL1, "v2"), (PL1, "v3")] and r.deferred == 0
+    assert state.seen(["v3"]) == {"v3"}
+
+
+def test_budget_counts_units_already_used_today(state):
+    state.add_quota(DAY, 7990)
+    yt = FakeYT()
+    r = go(graph(), yt, state, ["v1"], budget=8000)
+    assert yt.inserts == [] and r.deferred == 1 and state.seen(["v1"]) == set()
+
+
+def test_insert_error_does_not_stop_others_and_gives_up_after_three_runs(state):
+    yt = FakeYT()
+    yt.insert_errors[(PL1, "v1")] = [YouTubeError("boom")] * 3
+    r = go(graph(), yt, state, ["v1", "v2"])
+    assert yt.inserts == [(PL1, "v2")] and len(r.errors) == 1 and "boom" in r.errors[0]
+    assert state.seen(["v1", "v2"]) == {"v2"} and state.failures("v1") == 1
+    fresh_meter(yt)
+    go(graph(), yt, state, ["v1", "v2"])
+    assert state.failures("v1") == 2 and state.seen(["v1"]) == set()
+    fresh_meter(yt)
+    r = go(graph(), yt, state, ["v1", "v2"])
+    assert r.gave_up == ["v1"] and state.seen(["v1"]) == {"v1"}
+    assert state.gave_up() == [("v1", "boom")]
+    assert "Gave up" in runner.render(r)
+
+
+def test_failed_filing_does_not_block_other_playlist_and_only_it_is_retried(state):
+    yt = FakeYT()
+    yt.insert_errors[(PL1, "v1")] = [YouTubeError("boom")]
+    go(graph(PL1, PL2), yt, state, ["v1"])
+    assert yt.inserts == [(PL2, "v1")] and not state.is_filed("v1", PL1)
+    fresh_meter(yt)
+    go(graph(PL1, PL2), yt, state, ["v1"])
+    assert yt.inserts == [(PL2, "v1"), (PL1, "v1")]
+
+
+def test_quota_exceeded_stops_cleanly_and_saves_state(state):
+    yt = FakeYT()
+    yt.insert_errors[(PL1, "v2")] = [QuotaExceededError("q")]
+    r = go(graph(), yt, state, ["v1", "v2", "v3"])
+    assert yt.inserts == [(PL1, "v1")] and yt.calls.count("insert") == 2
+    assert r.quota_stopped and r.deferred == 2
+    assert state.seen(["v1", "v2", "v3"]) == {"v1"} and state.is_filed("v1", PL1)
+    assert state.quota_used(DAY) == yt.meter.total  # the failed call is metered and persisted
+    assert state._db.execute("SELECT finished_at FROM runs").fetchone()[0] is not None
+
+
+def test_quota_exceeded_during_detection_saves_state(state):
+    class Boom(FakeYT):
+        def videos(self, ids):
+            self._read("videos")
+            raise QuotaExceededError("q")
+
+    yt = Boom()
+    r = go(graph(), yt, state, ["v1"])
+    assert r.quota_stopped and state.quota_used(DAY) == yt.meter.total == 2
+
+
+def test_rate_limit_retries_once_then_succeeds(state):
+    yt = FakeYT()
+    yt.insert_errors[(PL1, "v1")] = [RateLimitedError("r")]
+    sleeps = []
+    r = go(graph(), yt, state, ["v1"], sleep=sleeps.append)
+    assert sleeps == [2] and yt.inserts == [(PL1, "v1")] and r.deferred == 0 and r.errors == []
+
+
+def test_rate_limit_twice_defers_video(state):
+    yt = FakeYT()
+    yt.insert_errors[(PL1, "v1")] = [RateLimitedError("r")] * 2
+    r = go(graph(), yt, state, ["v1", "v2"])
+    assert r.deferred == 1 and yt.inserts == [(PL1, "v2")]
+    assert state.seen(["v1"]) == set() and state.failures("v1") == 0
+
+
+def test_playlist_full_skips_further_inserts(state):
+    yt = FakeYT()
+    yt.insert_errors[(PL1, "v1")] = [PlaylistFullError("full")]
+    r = go(graph(), yt, state, ["v1", "v2"])
+    assert yt.calls.count("insert") == 1 and PL1 in r.full_playlists
+    assert any("full" in e for e in r.errors)
+    assert state.failures("v2") == 1
+
+
+def test_foreign_playlist_is_a_config_error_before_any_work(state):
+    yt = FakeYT()
+    r = go(graph(PL1, OTHER), yt, state, ["v1"])
+    assert r.config_errors and OTHER in r.config_errors[0]
+    assert yt.inserts == [] and "videos" not in yt.calls and state.seen(["v1"]) == set()
+    assert "Config errors" in runner.render(r)
+
+
+def test_allow_any_playlist_permits_foreign(state):
+    yt = FakeYT()
+    r = go(graph(OTHER), yt, state, ["v1"], allow_any_playlist=True)
+    assert yt.inserts == [(OTHER, "v1")] and not r.config_errors
+
+
+def test_unmatched_video_is_marked_seen_and_counted(state):
+    yt = FakeYT()
+    r = go(keyword_graph("nomatch"), yt, state, ["v1"])
+    assert state.seen(["v1"]) == {"v1"} and r.dropped_by_node == {"kw": 1} and yt.inserts == []
+    assert "kw: 1" in runner.render(r)
+
+
+def sub_graph():
+    return parse_graph({"version": 1, "nodes": [
+        {"id": "s", "type": "source.subscriptions"},
+        {"id": "d", "type": "destination.playlist", "params": {"playlist_id": PL1}}],
+        "edges": [{"from": "s", "to": "d"}]})
+
+
+def test_subscriptions_resolved_and_cached_24h(state):
+    yt = FakeYT(subs=[CH])
+    go(sub_graph(), yt, state, ["v1"])
+    assert yt.inserts == [(PL1, "v1")] and yt.calls.count("subscriptions") == 1
+    fresh_meter(yt)
+    go(sub_graph(), yt, state, ["v2"])
+    assert yt.calls.count("subscriptions") == 1  # cached
+    later = datetime(2026, 10, 31, 10, 0, tzinfo=timezone.utc)
+    runner.run(sub_graph(), yt, state, yt.meter, later, 8000, fetch=fetcher(["v3"]))
+    assert yt.calls.count("subscriptions") == 2
+
+
+def test_quota_day_is_pacific():
+    assert runner.quota_day(datetime(2026, 10, 30, 6, 59, tzinfo=timezone.utc)) == "2026-10-29"
+    assert runner.quota_day(datetime(2026, 10, 30, 7, 1, tzinfo=timezone.utc)) == "2026-10-30"
+
+
+def test_error_mapping_for_duplicates_and_full_playlists():
+    assert isinstance(_map_error(http_error(409, "videoAlreadyInPlaylist"), "x"), AlreadyInPlaylistError)
+    assert isinstance(_map_error(http_error(403, "playlistContainsMaximumNumberOfVideos"), "x"), PlaylistFullError)
+
+
+def test_preview_node_is_read_only(state):
+    snap = State.throwaway_copy()
+    snap.mark_channel_known(CH, NOW)
+    passing = runner.preview_node(keyword_graph("v1"), "kw", FakeYT(), snap, NOW, fetcher(["v1", "v2"]), 0)
+    snap.close()
+    assert [v.video_id for v in passing] == ["v1"]
+    assert state.seen(["v1", "v2"]) == set()
+
+
+# --- CLI ---
+
+def test_cli_auth_expired_exit_2(monkeypatch, capsys):
+    def boom():
+        raise auth.AuthExpiredError("Google rejected the stored token")
+
+    monkeypatch.setattr(cli, "_client", boom)
+    assert cli.main(["run", "--graph", "graphs/example.yaml"]) == 2
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1 and "expired or was revoked" in err and "7 days" in err
+
+
+def test_cli_dry_run_and_preview_end_to_end(monkeypatch, capsys, tmp_path):
+    gpath = tmp_path / "g.json"
+    gpath.write_text(json.dumps({"version": 1, "nodes": [
+        {"id": "s", "type": "source.channel", "params": {"channel_id": CH}},
+        {"id": "d", "type": "destination.playlist", "params": {"playlist_id": PL1}}],
+        "edges": [{"from": "s", "to": "d"}]}))
+    yt = FakeYT()
+    monkeypatch.setattr(cli, "_client", lambda: (yt, yt.meter))
+    monkeypatch.setattr(runner, "fetch_url", fetcher(["v1"]))
+    assert cli.main(["run", "--graph", str(gpath), "--dry-run", "--backfill", "5"]) == 0
+    assert "DRY RUN" in capsys.readouterr().out
+    assert yt.inserts == [] and not (settings.data_dir / "state.db").exists()
+    assert cli.main(["preview", "--graph", str(gpath), "--node", "s"]) == 0
+    assert "v1" in capsys.readouterr().out
+    assert cli.main(["preview", "--graph", str(gpath), "--node", "nope"]) == 1
+    capsys.readouterr()
