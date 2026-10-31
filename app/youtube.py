@@ -18,6 +18,10 @@ class QuotaExceededError(YouTubeError):
     pass
 
 
+class RateLimitedError(YouTubeError):
+    """Too many requests in a short time; unlike quota, retrying later the same day can work."""
+
+
 class ForbiddenError(YouTubeError):
     pass
 
@@ -58,8 +62,10 @@ def _reason(err: HttpError) -> str:
 def _map_error(err: HttpError, what: str) -> YouTubeError:
     status = getattr(err.resp, "status", None)
     reason = _reason(err)
-    if reason in ("quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded"):
+    if reason in ("quotaExceeded", "dailyLimitExceeded"):
         return QuotaExceededError(f"YouTube quota exceeded during {what}. It resets at midnight Pacific time.")
+    if reason in ("rateLimitExceeded", "userRateLimitExceeded"):
+        return RateLimitedError(f"YouTube rate limit hit during {what}; wait a bit and retry.")
     if status == 404 or reason in ("notFound", "playlistNotFound", "channelNotFound", "videoNotFound"):
         return NotFoundError(f"Not found during {what}.")
     if status == 403:
@@ -80,6 +86,7 @@ class RealYouTube:
         try:
             resp = request.execute()
         except HttpError as err:
+            self.meter.record(call, units)  # YouTube generally charges for failed requests too
             raise _map_error(err, call) from None
         self.meter.record(call, units)
         return resp
@@ -111,6 +118,8 @@ class RealYouTube:
         return items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
 
     def playlist_items(self, playlist_id: str, max_items: int) -> list[dict[str, Any]]:
+        if max_items <= 0:
+            return []
         return self._paged(
             "playlistItems.list",
             lambda token: self._svc.playlistItems().list(

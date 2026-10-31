@@ -40,7 +40,7 @@ def run_auth(client_secret_path: Path | None = None) -> None:
     path = client_secret_path or settings.client_secret_path
     _read_client_config(path)
     flow = InstalledAppFlow.from_client_secrets_file(str(path), SCOPES)
-    creds = flow.run_local_server(host="127.0.0.1", port=0)
+    creds = flow.run_local_server(host="127.0.0.1", port=0, prompt="consent")
     if not creds.refresh_token:
         raise AuthError("Google returned no refresh token. Remove the app's access in your Google account and re-run auth.")
     keyring.set_password(KEYRING_SERVICE, KEYRING_USER, creds.refresh_token)

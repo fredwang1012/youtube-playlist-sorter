@@ -8,7 +8,7 @@ from httplib2 import Response
 
 from app import auth, cli
 from app.config import ROOT, Settings
-from app.youtube import ForbiddenError, NotFoundError, QuotaExceededError, QuotaMeter, RealYouTube
+from app.youtube import ForbiddenError, NotFoundError, QuotaExceededError, QuotaMeter, RateLimitedError, RealYouTube
 
 
 class FakeRequest:
@@ -97,6 +97,7 @@ def test_run_auth_stores_token_in_keychain(client_secret, memory_keyring, monkey
     assert memory_keyring.store[(auth.KEYRING_SERVICE, auth.KEYRING_USER)] == "refresh-abc"
     assert seen["scopes"] == ["https://www.googleapis.com/auth/youtube.force-ssl"]
     assert seen["host"] == "127.0.0.1"
+    assert seen["prompt"] == "consent"
     out = capsys.readouterr()
     assert "refresh-abc" not in out.out + out.err
 
@@ -177,6 +178,9 @@ def test_playlist_items_respects_max():
 
 @pytest.mark.parametrize("status,reason,exc", [
     (403, "quotaExceeded", QuotaExceededError),
+    (403, "dailyLimitExceeded", QuotaExceededError),
+    (403, "rateLimitExceeded", RateLimitedError),
+    (403, "userRateLimitExceeded", RateLimitedError),
     (403, "forbidden", ForbiddenError),
     (404, "playlistNotFound", NotFoundError),
 ])
@@ -186,7 +190,26 @@ def test_http_errors_mapped_without_body(status, reason, exc):
     with pytest.raises(exc) as e:
         RealYouTube(svc, meter).my_playlists()
     assert "SECRET BODY" not in str(e.value)
-    assert meter.total == 0
+    assert meter.total == 1  # failed requests are still charged
+
+
+def test_rate_limit_message_is_not_the_quota_message():
+    svc = FakeService(playlists=[http_error(403, "rateLimitExceeded"), http_error(403, "quotaExceeded")])
+    yt = RealYouTube(svc, QuotaMeter())
+    with pytest.raises(RateLimitedError) as rate:
+        yt.my_playlists()
+    with pytest.raises(QuotaExceededError) as quota:
+        yt.my_playlists()
+    assert "midnight" not in str(rate.value)
+    assert "midnight Pacific" in str(quota.value)
+    assert not isinstance(rate.value, QuotaExceededError)
+
+
+def test_playlist_items_zero_max_makes_no_call():
+    svc = FakeService()
+    meter = QuotaMeter()
+    assert RealYouTube(svc, meter).playlist_items("UU1", 0) == []
+    assert svc.log == [] and meter.total == 0
 
 
 def test_cli_playlists_lists_ids(monkeypatch, capsys):
