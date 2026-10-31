@@ -66,3 +66,11 @@ def _empty_queue_cache():
     queue.invalidate()
     yield
     queue.invalidate()
+
+
+@pytest.fixture(autouse=True)
+def _no_lock_wait(monkeypatch):
+    """A locked real run fails at once unless a test sets a wait."""
+    from app import cli, jobs
+    monkeypatch.setattr(cli, "TIMER_LOCK_WAIT", 0.0)
+    monkeypatch.setattr(jobs, "LOCK_RETRY_SECONDS", 0.01)

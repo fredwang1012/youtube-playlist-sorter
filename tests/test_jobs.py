@@ -1,6 +1,7 @@
 """Shared run entry point: the timer (CLI) and "Check now" both go through jobs.run_now under the run lock."""
 import json
 import threading
+from datetime import timedelta
 
 import httplib2
 import pytest
@@ -11,6 +12,27 @@ from app.lock import run_lock
 from app.state import State
 from tests.test_detect import CH
 from tests.test_run import NOW, PL1, FakeYT, fetcher
+
+
+@pytest.fixture(autouse=True)
+def _fresh_jobs(monkeypatch):
+    monkeypatch.setattr(jobs, "_thread", None)
+    monkeypatch.setattr(jobs, "_last", None)
+
+
+def hold_lock_in_thread():
+    """Hold the run lock from another thread (like a timer run); returns the release event and the thread."""
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with run_lock(settings.data_dir / "run.lock"):
+            held.set()
+            release.wait(5)
+
+    t = threading.Thread(target=hold, daemon=True)
+    t.start()
+    assert held.wait(5)
+    return release, t
 
 
 @pytest.fixture
@@ -92,10 +114,95 @@ def test_start_background_twice_runs_once(gpath, yt, monkeypatch):
     assert len(runs()) == 1 and yt.inserts == [(PL1, "v1")]
 
 
-def test_start_background_refuses_while_timer_holds_lock(gpath, yt):
+def test_start_background_lost_race_to_timer_is_recorded(gpath, yt):
     with run_lock(settings.data_dir / "run.lock"):
-        assert jobs.start_background("manual", make_client=lambda: (yt, yt.meter), now=NOW) == "already_running"
-    assert runs() == []
+        assert jobs.start_background("manual", make_client=lambda: (yt, yt.meter), now=NOW) == "started"
+        jobs._thread.join(5)
+    out = jobs.last_outcome()
+    assert out.status == "already_running" and out.trigger == "manual" and out.finished_at is not None
+    assert runs() == [] and yt.inserts == []
+
+
+def test_start_background_records_outcome(gpath, yt):
+    assert jobs.last_outcome() is None
+    jobs.start_background("manual", make_client=lambda: (yt, yt.meter), now=NOW)
+    jobs._thread.join(5)
+    out = jobs.last_outcome()
+    assert out.status == "done" and out.trigger == "manual" and out.report.filed == {PL1: 1}
+
+
+def test_start_background_auth_expired_is_recorded(gpath):
+    def boom():
+        raise auth.AuthExpiredError("Google rejected the stored token")
+
+    assert jobs.start_background("manual", make_client=boom, now=NOW) == "started"
+    jobs._thread.join(5)
+    out = jobs.last_outcome()
+    assert out.status == "error" and "auth" in out.message.lower() and out.trigger == "manual"
+    assert out.finished_at is not None
+
+
+def test_is_running(gpath, yt, monkeypatch):
+    s = State()
+    try:
+        assert not jobs.is_running(s, NOW)
+        # a timer run in progress in another process: unfinished row
+        rid = s.start_run(NOW)
+        assert jobs.is_running(s, NOW + timedelta(minutes=30))
+        assert not jobs.is_running(s, NOW + timedelta(hours=2, minutes=1))  # left by a crash
+        s.finish_run(rid, NOW, {})
+        assert not jobs.is_running(s, NOW)
+
+        release, entered = threading.Event(), threading.Event()
+        real_run = runner.run
+
+        def blocking_run(*args, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return real_run(*args, **kwargs)
+
+        monkeypatch.setattr(runner, "run", blocking_run)
+        jobs.start_background("manual", make_client=lambda: (yt, yt.meter), now=NOW)
+        assert entered.wait(5)
+        assert jobs.is_running(s, NOW)  # our thread, before its runs row exists
+        release.set()
+        jobs._thread.join(5)
+        assert not jobs.is_running(s, NOW)
+    finally:
+        s.close()
+
+
+def test_recent_runs_returns_old_shaped_rows_unchanged():
+    s = State()
+    try:
+        rid = s.start_run(NOW)
+        s.finish_run(rid, NOW, {"new_videos": 1, "filed": {PL1: 1}, "deferred": 0, "errors": 2, "units": 51})
+        assert s.recent_runs()[0]["summary"] == {
+            "new_videos": 1, "filed": {PL1: 1}, "deferred": 0, "errors": 2, "units": 51}
+    finally:
+        s.close()
+
+
+def test_cli_timer_run_waits_for_lock(gpath, yt, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "TIMER_LOCK_WAIT", 5.0)
+    release, holder = hold_lock_in_thread()
+    threading.Timer(0.3, release.set).start()
+    assert cli.main(["run", "--graph", str(gpath)]) == 0
+    capsys.readouterr()
+    holder.join(5)
+    assert yt.inserts == [(PL1, "v1")]
+
+
+def test_cli_timer_run_gives_up_after_wait(gpath, yt, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "TIMER_LOCK_WAIT", 0.1)
+    release, holder = hold_lock_in_thread()
+    try:
+        assert cli.main(["run", "--graph", str(gpath)]) == 3
+    finally:
+        release.set()
+        holder.join(5)
+    assert "another run is in progress" in capsys.readouterr().err.lower()
+    assert yt.inserts == []
 
 
 def test_run_now_auth_expired_is_error_not_exception(gpath):

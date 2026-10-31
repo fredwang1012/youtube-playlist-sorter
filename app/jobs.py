@@ -1,8 +1,11 @@
 """One run entry point shared by the timer (CLI `run`) and the UI's "Check now"; both hold the run lock."""
 import logging
 import threading
-from dataclasses import dataclass
-from datetime import datetime, timezone
+import time
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Callable, Literal
 
 import httplib2
@@ -21,6 +24,8 @@ log = logging.getLogger(__name__)
 
 Trigger = Literal["timer", "manual"]
 NETWORK_ERRORS = (TransportError, httplib2.ServerNotFoundError, OSError)  # OSError covers timeouts and resets
+LOCK_RETRY_SECONDS = 1.0
+STALE_RUN_AFTER = timedelta(hours=2)  # an unfinished runs row older than this was left by a crash
 
 
 @dataclass
@@ -29,11 +34,29 @@ class RunOutcome:
     report: runner.Report | None
     message: str
     error: Exception | None = None  # the original failure, so the CLI can keep its exit codes
+    trigger: Trigger | None = None  # set on background outcomes kept for last_outcome()
+    finished_at: datetime | None = None
 
 
 def real_client() -> tuple[RealYouTube, QuotaMeter]:
     meter = QuotaMeter()
     return RealYouTube.from_credentials(auth.load_credentials(), meter), meter
+
+
+@contextmanager
+def _locked(path: Path, wait: float):
+    """Take the run lock, retrying for up to `wait` seconds; raise AlreadyRunning after that."""
+    deadline = time.monotonic() + wait
+    with ExitStack() as stack:
+        while True:
+            try:
+                stack.enter_context(run_lock(path))
+                break
+            except AlreadyRunning:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(LOCK_RETRY_SECONDS)
+        yield
 
 
 def run_now(
@@ -44,8 +67,12 @@ def run_now(
     now: datetime | None = None,
     settings: Settings | None = None,
     backfill: int = 0,
+    wait: float = 0,
 ) -> RunOutcome:
-    """One real run under the lock. Never raises for expected failures; they come back as status "error"."""
+    """One real run under the lock, waiting up to `wait` seconds for it.
+
+    Never raises for expected failures; they come back as status "error".
+    """
     cfg = settings or default_settings
     if graph is None:
         try:
@@ -55,7 +82,7 @@ def run_now(
         except OSError as err:
             return RunOutcome("error", None, f"Cannot read graph file {cfg.graph_path}: {err.strerror or type(err).__name__}", err)
     try:
-        with run_lock(cfg.data_dir / "run.lock"):
+        with _locked(cfg.data_dir / "run.lock", wait):
             yt, meter = make_client()
             state = State(cfg.data_dir / "state.db")
             try:
@@ -85,21 +112,53 @@ def run_now(
 
 _thread: threading.Thread | None = None
 _start_guard = threading.Lock()
+_last: RunOutcome | None = None
+_last_guard = threading.Lock()
 
 
-def start_background(trigger: Trigger = "manual", **kwargs) -> Literal["started", "already_running"]:
-    """Start run_now in a daemon thread unless a run (this process's or the timer's) is already going."""
+def _background(trigger: Trigger, **kwargs) -> None:
+    global _last
+    outcome = run_now(trigger, **kwargs)
+    with _last_guard:
+        _last = replace(outcome, trigger=trigger, finished_at=datetime.now(timezone.utc))
+
+
+def last_outcome() -> RunOutcome | None:
+    """Outcome of the most recent background run in this process, including failures and lost races."""
+    with _last_guard:
+        return _last
+
+
+def start_background(
+    trigger: Trigger = "manual",
+    *,
+    graph: Graph | None = None,
+    backfill: int = 0,
+    make_client: Callable[[], tuple[object, QuotaMeter]] = real_client,
+    now: datetime | None = None,
+    settings: Settings | None = None,
+) -> Literal["started", "already_running"]:
+    """Start run_now in a daemon thread unless this process's previous one is still going.
+
+    The run lock is not probed here: probing would briefly hold it and could make a timer run exit. If the timer
+    holds the lock, the thread's run_now returns already_running and last_outcome() records it.
+    """
     global _thread
-    cfg = kwargs.get("settings") or default_settings
+    kwargs = dict(graph=graph, backfill=backfill, make_client=make_client, now=now, settings=settings)
     with _start_guard:
         if _thread is not None and _thread.is_alive():
             return "already_running"
-        try:
-            with run_lock(cfg.data_dir / "run.lock"):
-                pass
-        except AlreadyRunning:
-            return "already_running"
-        # a timer run could still take the lock before the thread does; run_now then reports already_running
-        _thread = threading.Thread(target=run_now, args=(trigger,), kwargs=kwargs, daemon=True, name="run-now")
+        _thread = threading.Thread(target=_background, args=(trigger,), kwargs=kwargs, daemon=True, name="run-now")
         _thread.start()
     return "started"
+
+
+def is_running(state: State, now: datetime | None = None) -> bool:
+    """True while our thread runs or the newest runs row is unfinished and recent (covers timer runs). No lock probe."""
+    if _thread is not None and _thread.is_alive():
+        return True
+    rows = state.recent_runs(limit=1)
+    if not rows or rows[0]["finished_at"] is not None:
+        return False
+    started = datetime.fromisoformat(rows[0]["started_at"])
+    return (now or datetime.now(timezone.utc)) - started < STALE_RUN_AFTER

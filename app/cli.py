@@ -14,6 +14,9 @@ from app.state import State
 from app.youtube import QuotaMeter, RealYouTube, YouTubeError
 
 
+TIMER_LOCK_WAIT = 120.0  # seconds a real run waits for the run lock before exiting 3
+
+
 def _client() -> tuple[RealYouTube, QuotaMeter]:
     return jobs.real_client()
 
@@ -63,8 +66,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 1
     if args.dry_run:
         return _dry_run(graph, args)
-    # the timer runs this command; "Check now" in the UI goes through the same jobs.run_now
-    outcome = jobs.run_now("timer", graph=graph, make_client=_client, backfill=args.backfill)
+    # the timer runs this command; "Check now" in the UI goes through the same jobs.run_now.
+    # A scheduled run waits out a brief overlap instead of being dropped until the next tick.
+    outcome = jobs.run_now("timer", graph=graph, make_client=_client, backfill=args.backfill, wait=TIMER_LOCK_WAIT)
     if outcome.status == "already_running":
         print("Another run is in progress; exiting.", file=sys.stderr)
         return 3
