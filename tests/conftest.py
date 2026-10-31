@@ -57,3 +57,12 @@ def client_secret(tmp_path):
 def _no_rss_retry_delay(monkeypatch):
     from app import rss
     monkeypatch.setattr(rss, "RETRY_DELAY_SECONDS", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _empty_queue_cache():
+    """The queue listing cache is per process; tests must not see each other's entries."""
+    from app import queue
+    queue.invalidate()
+    yield
+    queue.invalidate()

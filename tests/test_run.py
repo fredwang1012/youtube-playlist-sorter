@@ -14,8 +14,10 @@ from app.config import settings
 from app.graph import parse_graph
 from app.state import State
 from app.youtube import (
+    DELETE_COST,
     INSERT_COST,
     AlreadyInPlaylistError,
+    NotFoundError,
     PlaylistFullError,
     QuotaExceededError,
     QuotaMeter,
@@ -45,6 +47,8 @@ class FakeYT:
         self.accept_then_raise = {}  # same, but YouTube applies the insert before the error reaches the caller
         self.present = set()
         self.calls = []
+        self.queues = {}  # playlist id -> raw playlistItems resources
+        self.deletes = []
 
     def _read(self, name):
         self.calls.append(name)
@@ -77,6 +81,23 @@ class FakeYT:
     def playlist_contains(self, playlist_id, video_id):
         self._read("contains")
         return (playlist_id, video_id) in self.present
+
+    def queue_items(self, playlist_id):
+        items = list(self.queues.get(playlist_id, []))
+        for _ in range(max(1, -(-len(items) // 50))):  # 1 unit per page of 50
+            self._read("queue_items")
+        return items
+
+    def remove_playlist_item(self, item_id):
+        self.calls.append("delete")
+        self.meter.record("delete", DELETE_COST)
+        for items in self.queues.values():
+            for it in items:
+                if it["id"] == item_id:
+                    items.remove(it)
+                    self.deletes.append(item_id)
+                    return
+        raise NotFoundError("Not found during playlistItems.delete.")
 
 
 def graph(*playlists):

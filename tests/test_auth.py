@@ -38,6 +38,9 @@ class FakeResource:
     def insert(self, **kw):
         return self._call("insert", **kw)
 
+    def delete(self, **kw):
+        return self._call("delete", **kw)
+
 
 class FakeService:
     def __init__(self, **responses):
