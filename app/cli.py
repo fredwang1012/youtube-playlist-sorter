@@ -2,6 +2,7 @@
 import argparse
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httplib2
 from google.auth.exceptions import TransportError
@@ -61,6 +62,13 @@ def _graph(path: str):
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    if not args.dry_run:
+        if settings.real_runs_disabled:
+            print(f"Error: {jobs.REAL_RUNS_DISABLED}", file=sys.stderr)
+            return 5
+        if not Path(args.graph).exists():
+            print(jobs.NO_RULES)  # the timer on a fresh server, before any rules are saved
+            return 0
     graph = _graph(args.graph)
     if graph is None:
         return 1
@@ -74,6 +82,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 3
     if outcome.status == "error":
         raise outcome.error  # main() maps it to the usual message and exit code
+    if outcome.report is None:  # the graph file went away after it was read above
+        print(outcome.message)
+        return 0
     print(runner.render(outcome.report))
     return 1 if outcome.report.config_errors else 0
 

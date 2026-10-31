@@ -255,6 +255,12 @@ def test_logout_clears_session(api):
     assert api.client.get("/api/me").status_code == 401
 
 
+def test_signed_out_page_is_public_and_links_to_sign_in(env):
+    r = env.client.get("/auth/signed-out")
+    assert r.status_code == 200 and "Signed out" in r.text and 'href="/auth/login"' in r.text
+    assert "content-security-policy" in r.headers
+
+
 # --- Tailscale fallback ---
 
 def test_tailscale_mode_requires_owner_header(web_settings, tmp_path):

@@ -262,3 +262,47 @@ def test_cli_run_uses_jobs(gpath, yt, monkeypatch, capsys):
     assert cli.main(["run", "--graph", str(gpath)]) == 4
     assert capsys.readouterr().err == "Error: network unavailable, try again later.\n"
     assert seen == ["timer"] * 4
+
+
+# --- a fresh VM has no graph yet; the laptop can switch real runs off ---
+
+def test_run_now_missing_graph_means_no_rules_yet(tmp_path, monkeypatch, yt):
+    monkeypatch.setattr(settings, "graph_path", tmp_path / "missing.yaml")
+    called = []
+    out = jobs.run_now("manual", make_client=lambda: called.append(1) or (yt, yt.meter), now=NOW)
+    assert (out.status, out.report, out.message) == ("done", None, jobs.NO_RULES)
+    assert out.message == "No rules yet. Create them in the Rules tab."
+    assert called == [] and runs() == []
+
+
+def test_run_now_unreadable_graph_stays_an_error(tmp_path, monkeypatch, yt):
+    monkeypatch.setattr(settings, "graph_path", tmp_path)  # a directory: exists but cannot be read as a file
+    out = jobs.run_now("manual", make_client=lambda: (yt, yt.meter), now=NOW)
+    assert out.status == "error" and "cannot read" in out.message.lower()
+
+
+def test_cli_timer_run_without_graph_exits_0(tmp_path, yt, capsys):
+    assert cli.main(["run", "--graph", str(tmp_path / "missing.yaml")]) == 0
+    assert "No rules yet" in capsys.readouterr().out
+    assert yt.inserts == [] and runs() == []
+
+
+def test_cli_invalid_graph_stays_an_error(tmp_path, yt, capsys):
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"version": 1, "nodes": [], "edges": [{"from": "a", "to": "b"}]}))
+    assert cli.main(["run", "--graph", str(bad)]) == 1
+    assert cli.main(["run", "--graph", str(tmp_path / "missing.yaml"), "--dry-run"]) == 1  # a dry run needs a graph
+    capsys.readouterr()
+
+
+def test_real_runs_disabled_exits_5(gpath, yt, monkeypatch, capsys):
+    monkeypatch.setattr(settings, "real_runs_disabled", True)
+    assert cli.main(["run", "--graph", str(gpath)]) == 5
+    err = capsys.readouterr().err
+    assert "REAL_RUNS_DISABLED" in err and len(err.strip().splitlines()) == 1
+    assert yt.inserts == [] and runs() == []
+    assert cli.main(["run", "--graph", str(gpath), "--dry-run"]) == 0  # dry runs still work
+    capsys.readouterr()
+    out = jobs.run_now("manual", make_client=lambda: (yt, yt.meter), now=NOW)  # "Check now" on the laptop too
+    assert out.status == "error" and "REAL_RUNS_DISABLED" in out.message
+    assert yt.inserts == [] and runs() == []

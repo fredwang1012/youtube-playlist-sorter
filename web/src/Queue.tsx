@@ -33,6 +33,7 @@ interface RunState {
 function runResult(a: Activity): RunState {
   const last = a.last_manual;
   if (last?.status === "error") return { running: false, failed: true, text: `Check failed: ${last.message}` };
+  if (last?.status === "done" && last.message.startsWith("No rules yet")) return { running: false, text: last.message };
   if (last?.status === "already_running") return { running: false, text: "Another run was in progress; showing its results." };
   const filed = Object.values(a.runs[0]?.summary?.filed ?? {}).reduce((s, n) => s + n, 0);
   return { running: false, text: filed ? `Done. Filed ${filed} video${filed === 1 ? "" : "s"}.` : "Done. Nothing new." };

@@ -146,7 +146,7 @@ def build_router(cfg: Settings, deps: "Deps") -> APIRouter:
                 return {"playlist": None, "items": []}
             with youtube(state, now) as yt:
                 title = owned_playlists(yt, now).get(playlist_id, playlist_id)
-                items = queue.list_queue(yt, state, now)
+            items = queue.list_queue(yt, state, now)  # outside the block: list_queue charges its own units
         return {"playlist": {"id": playlist_id, "title": title}, "items": [asdict(i) for i in items]}
 
     @router.post("/queue/tick")

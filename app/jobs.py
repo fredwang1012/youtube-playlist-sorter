@@ -26,6 +26,8 @@ Trigger = Literal["timer", "manual"]
 NETWORK_ERRORS = (TransportError, httplib2.ServerNotFoundError, OSError)  # OSError covers timeouts and resets
 LOCK_RETRY_SECONDS = 1.0
 STALE_RUN_AFTER = timedelta(hours=2)  # an unfinished runs row older than this was left by a crash
+NO_RULES = "No rules yet. Create them in the Rules tab."
+REAL_RUNS_DISABLED = "Real runs are off on this machine (REAL_RUNS_DISABLED); use --dry-run here."
 
 
 @dataclass
@@ -74,7 +76,11 @@ def run_now(
     Never raises for expected failures; they come back as status "error".
     """
     cfg = settings or default_settings
+    if cfg.real_runs_disabled:
+        return RunOutcome("error", None, REAL_RUNS_DISABLED)
     if graph is None:
+        if not cfg.graph_path.exists():
+            return RunOutcome("done", None, NO_RULES)  # a fresh server: nothing to run until rules are saved
         try:
             graph = load_graph(cfg.graph_path)
         except GraphError as err:

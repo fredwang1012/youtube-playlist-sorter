@@ -187,7 +187,7 @@ function Account() {
     setError(null);
     try {
       await api.logout();
-      window.location.reload(); // the reload lands on Google sign-in
+      window.location.assign("/auth/signed-out");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setBusy(false);
@@ -207,8 +207,8 @@ function Account() {
         </div>
       ) : (
         <p className="muted small">
-          Signed in by Tailscale as {me.email}. Sign-out doesn't apply here: access follows this device being on the
-          tailnet.
+          Signed in by Tailscale as {me.email}. Sign-out doesn't apply here: access depends on this device being
+          signed in to Tailscale as the owner's login, not just on it being on the tailnet.
         </p>
       )}
       {error && <p className="notice error" role="alert">{error}</p>}

@@ -29,7 +29,8 @@ class Settings(BaseSettings):
     tick_quota_ceiling: int = 9500
     login_client_id: str = ""
     graph_path: Path = ROOT / "graphs" / "mine.yaml"
-    run_interval_hours: int = 6  # read only by the deploy kit
+    # set on the laptop once the VM does the real runs: separate state.db files would file videos twice
+    real_runs_disabled: bool = False
 
     @field_validator("data_dir", "graph_path")
     @classmethod

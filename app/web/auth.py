@@ -45,6 +45,13 @@ REFUSED_PAGE = (
     '<p><a href="/auth/login">Try again</a></p>'
 )
 
+SIGNED_OUT_PAGE = (
+    "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width, initial-scale=1'>"
+    "<title>Signed out</title>"
+    "<p>Signed out.</p>"
+    '<p><a href="/auth/login">Sign in again</a></p>'
+)
+
 
 class NotSignedIn(Exception):
     """No valid owner credential: 401 for the API, the login page for HTML."""
@@ -202,6 +209,10 @@ class Auth:
                 self._cookie(response, SESSION_COOKIE, session, SESSION_MAX_AGE, "/")
             response.delete_cookie(OAUTH_COOKIE, path="/auth", httponly=True, secure=True, samesite="lax")
             return response
+
+        @router.get("/signed-out")
+        def signed_out() -> Response:
+            return HTMLResponse(SIGNED_OUT_PAGE)  # where the UI goes after sign-out, instead of straight to Google
 
         @router.post("/logout")
         def logout(request: Request) -> Response:

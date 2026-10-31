@@ -81,6 +81,21 @@ def test_queue_and_tick_happy_path(api):
     s.close()
 
 
+def test_queue_listing_charged_once(api, monkeypatch):
+    monkeypatch.setattr(queue, "_cache", {})
+    with_queue(api)
+    s = db()
+    used, units = s.quota_used(DAY), api.yt.meter.total
+    s.close()
+    assert api.client.get("/api/queue").status_code == 200
+    s = db()
+    charged = s.quota_used(DAY) - used
+    s.close()
+    spent = api.yt.meter.total - units
+    assert spent >= 3  # playlists, queue items, videos
+    assert charged == spent
+
+
 def test_tick_queue_changed_409(api):
     with_queue(api)
     r = tick(api.client, "item1", "v1", playlist_id=PLA)

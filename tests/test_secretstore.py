@@ -57,7 +57,7 @@ def test_credentials_dir_defaults_to_env_for_systemd(monkeypatch, tmp_path):
 
 def test_server_setting_defaults(monkeypatch):
     for var in ("SECRETS_BACKEND", "CREDENTIALS_DIRECTORY", "AUTH_MODE", "OWNER_EMAIL", "PUBLIC_URL",
-                "BIND_PORT", "TICK_QUOTA_CEILING", "GRAPH_PATH", "RUN_INTERVAL_HOURS"):
+                "BIND_PORT", "TICK_QUOTA_CEILING", "GRAPH_PATH", "REAL_RUNS_DISABLED"):
         monkeypatch.delenv(var, raising=False)
     s = Settings(_env_file=None)
     assert s.secrets_backend == "keyring"
@@ -71,7 +71,8 @@ def test_server_setting_defaults(monkeypatch):
     assert s.login_client_id == ""
     assert s.graph_path == Settings.model_fields["graph_path"].default
     assert s.graph_path.parts[-2:] == ("graphs", "mine.yaml")
-    assert s.run_interval_hours == 6
+    assert s.real_runs_disabled is False
+    assert "run_interval_hours" not in Settings.model_fields  # the timer unit owns the schedule
 
 
 def test_relative_graph_path_anchored_to_root():
