@@ -1,4 +1,8 @@
-"""YouTube Data API wrapper. Every call records its quota cost; the only write is playlistItems.insert."""
+"""YouTube Data API wrapper. Every call records its quota cost.
+
+The writes are playlistItems.insert and playlistItems.delete; delete is called only from app.queue.tick, which
+checks the item belongs to the saved queue playlist first.
+"""
 import json
 from typing import Any, Callable, Protocol
 
@@ -7,6 +11,7 @@ from googleapiclient.errors import HttpError
 
 READ_COST = 1
 INSERT_COST = 50
+DELETE_COST = 50
 VIDEOS_BATCH = 50
 
 
@@ -55,6 +60,8 @@ class QuotaMeter:
 
 
 class YouTubeAPI(Protocol):
+    meter: QuotaMeter
+
     def my_channel(self) -> dict[str, Any]: ...
     def channels_uploads_playlist(self, channel_id: str) -> str: ...
     def playlist_items(self, playlist_id: str, max_items: int) -> list[dict[str, Any]]: ...
@@ -63,6 +70,8 @@ class YouTubeAPI(Protocol):
     def subscriptions(self) -> list[dict[str, Any]]: ...
     def playlist_contains(self, playlist_id: str, video_id: str) -> bool: ...
     def insert_into_playlist(self, playlist_id: str, video_id: str) -> None: ...
+    def queue_items(self, playlist_id: str) -> list[dict[str, Any]]: ...
+    def remove_playlist_item(self, item_id: str) -> None: ...
 
 
 def _reason(err: HttpError) -> str:
@@ -204,3 +213,16 @@ class RealYouTube:
             }
         }
         self._run(self._svc.playlistItems().insert(part="snippet", body=body), "playlistItems.insert", INSERT_COST)
+
+    def queue_items(self, playlist_id: str) -> list[dict[str, Any]]:
+        """Every item of the queue playlist, as raw playlistItems resources (1 unit per page of 50)."""
+        return self._paged(
+            "playlistItems.list",
+            lambda token: self._svc.playlistItems().list(
+                part="snippet,contentDetails", playlistId=playlist_id, maxResults=50, pageToken=token
+            ),
+        )
+
+    def remove_playlist_item(self, item_id: str) -> None:
+        """Delete one playlist item (50 units). Only app.queue.tick may call this."""
+        self._run(self._svc.playlistItems().delete(id=item_id), "playlistItems.delete", DELETE_COST)

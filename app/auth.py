@@ -1,18 +1,17 @@
-"""OAuth for a Desktop-app client: loopback consent flow, refresh token kept in the OS keychain only."""
+"""OAuth for a Desktop-app client: loopback consent flow, refresh token kept only in the secret store."""
 import json
 from pathlib import Path
 
-import keyring
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
+from app import secretstore
 from app.config import settings
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
-KEYRING_SERVICE = "youtube-playlist-sorter"
-KEYRING_USER = "refresh-token"
+REFRESH_TOKEN = "refresh-token"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 
@@ -40,20 +39,26 @@ def _read_client_config(path: Path | None = None) -> dict:
 
 
 def run_auth(client_secret_path: Path | None = None) -> None:
-    """Run the loopback consent flow and store the refresh token in the keychain."""
+    """Run the loopback consent flow and store the refresh token in the secret store."""
     path = client_secret_path or settings.client_secret_path
     _read_client_config(path)
     flow = InstalledAppFlow.from_client_secrets_file(str(path), SCOPES)
     creds = flow.run_local_server(host="127.0.0.1", port=0, prompt="consent")
     if not creds.refresh_token:
         raise AuthError("Google returned no refresh token. Remove the app's access in your Google account and re-run auth.")
-    keyring.set_password(KEYRING_SERVICE, KEYRING_USER, creds.refresh_token)
+    try:
+        secretstore.set(REFRESH_TOKEN, creds.refresh_token)
+    except secretstore.SecretStoreError as e:
+        raise AuthError(str(e)) from None
 
 
 def load_credentials() -> Credentials:
-    """Credentials with a fresh access token, built from the keychain refresh token."""
+    """Credentials with a fresh access token, built from the stored refresh token."""
     cfg = _read_client_config()
-    refresh_token = keyring.get_password(KEYRING_SERVICE, KEYRING_USER)
+    try:
+        refresh_token = secretstore.get(REFRESH_TOKEN)
+    except secretstore.SecretStoreError as e:
+        raise AuthError(str(e)) from None
     if not refresh_token:
         raise AuthError("Not signed in. Run: python -m app.cli auth")
     creds = Credentials(

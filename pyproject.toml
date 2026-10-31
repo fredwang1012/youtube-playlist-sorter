@@ -4,14 +4,18 @@ version = "0.1.0"
 description = "Daily rule-based filing of new YouTube uploads into the owner's playlists, within the API quota"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "fastapi>=0.162.0",
     "google-api-python-client>=2.201.0",
     "google-auth>=2.62.0",
     "google-auth-oauthlib>=1.5.0",
+    "httpx>=0.28.1",
+    "itsdangerous>=2.2.0",
     "keyring>=25.7.0",
     "pydantic-settings>=2.16.2",
     "pyyaml>=6.0.3",
     "regex>=2026.9.29",
     "tzdata>=2026.6",
+    "uvicorn>=0.54.0",
 ]
 
 [dependency-groups]
@@ -22,3 +26,7 @@ package = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Starlette's TestClient asks for the httpx2 fork; tests keep httpx until that fork has been vetted
+filterwarnings = [
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]

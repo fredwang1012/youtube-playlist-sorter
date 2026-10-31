@@ -1,0 +1,13 @@
+# Runs ytps-run.service every 6 hours (00:00, 06:00, 12:00, 18:00 VM time), plus a missed run after downtime.
+# To change the schedule: sudo systemctl edit ytps-run.timer
+[Unit]
+Description=youtube-playlist-sorter run every 6 hours
+
+[Timer]
+OnCalendar=*-*-* 00/6:00:00
+Persistent=true
+RandomizedDelaySec=10m
+Unit=ytps-run.service
+
+[Install]
+WantedBy=timers.target

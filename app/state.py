@@ -115,6 +115,16 @@ class State:
                 (now.isoformat(), json.dumps(summary), run_id),
             )
 
+    def recent_runs(self, limit: int = 20) -> list[dict]:
+        """Newest first; summary is None for a run that has not finished (or died mid-run)."""
+        rows = self._db.execute(
+            "SELECT id, started_at, finished_at, summary FROM runs ORDER BY id DESC LIMIT ?", (limit,)
+        )
+        return [
+            {"id": r[0], "started_at": r[1], "finished_at": r[2], "summary": json.loads(r[3]) if r[3] else None}
+            for r in rows
+        ]
+
     def kv_get(self, key: str) -> tuple[str, datetime] | None:
         row = self._db.execute("SELECT value, at FROM kv WHERE key = ?", (key,)).fetchone()
         return (row[0], datetime.fromisoformat(row[1])) if row else None

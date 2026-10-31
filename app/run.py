@@ -221,6 +221,7 @@ def run(
     fetch: Fetcher = fetch_url,
     sleep: Callable[[float], None] = time.sleep,
     backfill: int = 0,
+    trigger: str | None = None,
 ) -> Report:
     """Execute one run. In a dry run `state` must be a throwaway copy. Quota used is persisted even on failure."""
     day = quota_day(now)
@@ -243,14 +244,15 @@ def run(
         report.orphaned = sum(1 for _v, pid, _c, _a in state.pending_rows() if pid not in _destinations(graph))
         report.units_today = state.quota_used(day)
         if not dry_run:
-            state.finish_run(run_id, now, _summary(report))
+            state.finish_run(run_id, now, _summary(report, trigger))
     return report
 
 
-def _summary(r: Report) -> dict:
+def _summary(r: Report, trigger: str | None) -> dict:
     return {
-        "new_videos": r.new_videos, "filed": dict(r.filed), "deferred": r.deferred, "errors": len(r.errors),
-        "units": r.units_run,
+        "trigger": trigger, "new_videos": r.new_videos, "filed": dict(r.filed), "already": r.already,
+        "deferred": r.deferred, "errors": [*r.config_errors, *r.errors], "gave_up": list(r.gave_up),
+        "units_run": r.units_run, "units_today": r.units_today, "budget": r.budget,
     }
 
 

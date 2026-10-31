@@ -1,0 +1,47 @@
+# One sort run of /var/lib/ytps/mine.yaml, started by ytps-run.timer. It shares the run lock with "Check now".
+# Installed to /etc/systemd/system by deploy/push.sh. Setup and secrets: docs/REMOTE.md.
+[Unit]
+Description=youtube-playlist-sorter scheduled run
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ytps
+Group=ytps
+WorkingDirectory=/opt/ytps
+EnvironmentFile=/etc/ytps/env
+Environment=SECRETS_BACKEND=systemd
+Environment=DATA_DIR=/var/lib/ytps
+Environment=GRAPH_PATH=/var/lib/ytps/mine.yaml
+Environment=CLIENT_SECRET_PATH=/etc/ytps/client_secret.json
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+# only the YouTube token: a run needs no sign-in secrets
+LoadCredentialEncrypted=refresh-token:/etc/ytps/creds/refresh-token.cred
+ExecStart=/opt/ytps-venv/bin/python -m app.cli run --graph /var/lib/ytps/mine.yaml
+TimeoutStartSec=30min
+UMask=0077
+
+# sandbox; if this systemd rejects a directive, comment it out and report it (docs/REMOTE.md)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/ytps
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=

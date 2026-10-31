@@ -208,10 +208,23 @@ schtasks /Delete /TN "YouTube Playlist Sorter" /F
 
 Exit codes: 0 success, 1 error or invalid graph, 2 Google sign-in expired or revoked (run `auth`), 3 another run is
 already in progress (real runs take a lock on `data/run.lock`; dry runs and `preview` do not), 4 network unavailable
-(try again later; anything already filed stays recorded and queued filings are kept).
+(try again later; anything already filed stays recorded and queued filings are kept), 5 real runs are turned off on
+this machine (`REAL_RUNS_DISABLED=true`, see below).
 
 Read the log with `Get-Content data\run.log -Tail 40` in PowerShell. If it says Google sign-in expired or was
 revoked, run `auth` again.
+
+## Running on a server
+
+The web UI and the scheduled runs can live on a small Linux VM, so they work with the laptop off. A systemd service
+serves the page on `127.0.0.1`, a systemd timer runs the sort every 6 hours, `tailscale serve` publishes it as HTTPS
+on the tailnet (never Funnel), and the secrets are encrypted with `systemd-creds`. The kit is in `deploy/`
+(`setup.sh` on the VM, `push.sh` from Git Bash on the laptop, and the unit files). Setup, the security model, checks
+and how to revoke everything: [docs/REMOTE.md](docs/REMOTE.md).
+
+Once the VM runs real sorts, the laptop must not: the two keep separate `state.db` files, so a laptop run would file
+the same videos again. Delete the scheduled task and add `REAL_RUNS_DISABLED=true` to the laptop's `.env`, which makes
+`run` without `--dry-run` (and Check now in a local UI) refuse with exit code 5.
 
 ## Tests
 

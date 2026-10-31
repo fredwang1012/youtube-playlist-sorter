@@ -1,23 +1,25 @@
-"""Command line entry: python -m app.cli <auth|whoami|playlists|channels|run|preview>."""
+"""Command line entry: python -m app.cli <auth|whoami|playlists|channels|run|preview|serve>."""
 import argparse
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httplib2
 from google.auth.exceptions import TransportError
 
-from app import auth
+from app import auth, jobs
 from app import run as runner
 from app.config import settings
-from app.lock import AlreadyRunning, run_lock
 from app.graph import GraphError, NotImplementedInThisVersion, load_graph
 from app.state import State
 from app.youtube import QuotaMeter, RealYouTube, YouTubeError
 
 
+TIMER_LOCK_WAIT = 120.0  # seconds a real run waits for the run lock before exiting 3
+
+
 def _client() -> tuple[RealYouTube, QuotaMeter]:
-    meter = QuotaMeter()
-    return RealYouTube.from_credentials(auth.load_credentials(), meter), meter
+    return jobs.real_client()
 
 
 def cmd_auth(_: argparse.Namespace) -> int:
@@ -60,26 +62,40 @@ def _graph(path: str):
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    if not args.dry_run:
+        if settings.real_runs_disabled:
+            print(f"Error: {jobs.REAL_RUNS_DISABLED}", file=sys.stderr)
+            return 5
+        if not Path(args.graph).exists():
+            print(jobs.NO_RULES)  # the timer on a fresh server, before any rules are saved
+            return 0
     graph = _graph(args.graph)
     if graph is None:
         return 1
     if args.dry_run:
-        return _run_once(graph, args)
-    try:
-        with run_lock(settings.data_dir / "run.lock"):
-            return _run_once(graph, args)
-    except AlreadyRunning:
+        return _dry_run(graph, args)
+    # the timer runs this command; "Check now" in the UI goes through the same jobs.run_now.
+    # A scheduled run waits out a brief overlap instead of being dropped until the next tick.
+    outcome = jobs.run_now("timer", graph=graph, make_client=_client, backfill=args.backfill, wait=TIMER_LOCK_WAIT)
+    if outcome.status == "already_running":
         print("Another run is in progress; exiting.", file=sys.stderr)
         return 3
+    if outcome.status == "error":
+        raise outcome.error  # main() maps it to the usual message and exit code
+    if outcome.report is None:  # the graph file went away after it was read above
+        print(outcome.message)
+        return 0
+    print(runner.render(outcome.report))
+    return 1 if outcome.report.config_errors else 0
 
 
-def _run_once(graph, args: argparse.Namespace) -> int:
+def _dry_run(graph, args: argparse.Namespace) -> int:
     yt, meter = _client()
-    state = State.throwaway_copy() if args.dry_run else State()
+    state = State.throwaway_copy()
     try:
         report = runner.run(
             graph, yt, state, meter, datetime.now(timezone.utc), settings.daily_quota_budget,
-            allow_any_playlist=settings.allow_any_playlist, dry_run=args.dry_run, backfill=args.backfill, fetch=runner.fetch_url,
+            allow_any_playlist=settings.allow_any_playlist, dry_run=True, backfill=args.backfill, fetch=runner.fetch_url,
         )
     finally:
         state.close()
@@ -107,9 +123,20 @@ def cmd_preview(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve(_: argparse.Namespace) -> int:
+    # imported here so the other commands do not load the web stack
+    import uvicorn
+
+    from app.web.server import create_app
+
+    # loopback only: tailscale serve publishes it to the tailnet. No access log: callback URLs carry sign-in codes.
+    uvicorn.run(create_app(settings), host="127.0.0.1", port=settings.bind_port, access_log=False)
+    return 0
+
+
 COMMANDS = {
     "auth": cmd_auth, "whoami": cmd_whoami, "playlists": cmd_playlists, "channels": cmd_channels,
-    "run": cmd_run, "preview": cmd_preview,
+    "run": cmd_run, "preview": cmd_preview, "serve": cmd_serve,
 }
 AUTH_EXPIRED = (
     "Google sign-in expired or was revoked - run: py -3.12 -m uv run python -m app.cli auth "
