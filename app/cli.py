@@ -6,18 +6,16 @@ from datetime import datetime, timezone
 import httplib2
 from google.auth.exceptions import TransportError
 
-from app import auth
+from app import auth, jobs
 from app import run as runner
 from app.config import settings
-from app.lock import AlreadyRunning, run_lock
 from app.graph import GraphError, NotImplementedInThisVersion, load_graph
 from app.state import State
 from app.youtube import QuotaMeter, RealYouTube, YouTubeError
 
 
 def _client() -> tuple[RealYouTube, QuotaMeter]:
-    meter = QuotaMeter()
-    return RealYouTube.from_credentials(auth.load_credentials(), meter), meter
+    return jobs.real_client()
 
 
 def cmd_auth(_: argparse.Namespace) -> int:
@@ -64,22 +62,25 @@ def cmd_run(args: argparse.Namespace) -> int:
     if graph is None:
         return 1
     if args.dry_run:
-        return _run_once(graph, args)
-    try:
-        with run_lock(settings.data_dir / "run.lock"):
-            return _run_once(graph, args)
-    except AlreadyRunning:
+        return _dry_run(graph, args)
+    # the timer runs this command; "Check now" in the UI goes through the same jobs.run_now
+    outcome = jobs.run_now("timer", graph=graph, make_client=_client, backfill=args.backfill)
+    if outcome.status == "already_running":
         print("Another run is in progress; exiting.", file=sys.stderr)
         return 3
+    if outcome.status == "error":
+        raise outcome.error  # main() maps it to the usual message and exit code
+    print(runner.render(outcome.report))
+    return 1 if outcome.report.config_errors else 0
 
 
-def _run_once(graph, args: argparse.Namespace) -> int:
+def _dry_run(graph, args: argparse.Namespace) -> int:
     yt, meter = _client()
-    state = State.throwaway_copy() if args.dry_run else State()
+    state = State.throwaway_copy()
     try:
         report = runner.run(
             graph, yt, state, meter, datetime.now(timezone.utc), settings.daily_quota_budget,
-            allow_any_playlist=settings.allow_any_playlist, dry_run=args.dry_run, backfill=args.backfill, fetch=runner.fetch_url,
+            allow_any_playlist=settings.allow_any_playlist, dry_run=True, backfill=args.backfill, fetch=runner.fetch_url,
         )
     finally:
         state.close()
