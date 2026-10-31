@@ -33,8 +33,9 @@ Files on the VM:
   with any value and be the owner. Run nothing else on this VM that you would not trust with the owner's YouTube
   account, and give nobody else a login on it. Google mode does not trust the header at all.
 - **Secrets are encrypted at rest.** The YouTube refresh token, the Google login client secret and the
-  session-cookie key are `systemd-creds` files under `/etc/ytps/creds`. systemd decrypts them only for the two
-  services. No secret is ever a plain file on the VM, an argument on a command line, or printed.
+  session-cookie key are `systemd-creds` files under `/etc/ytps/creds`. systemd decrypts them only for the
+  services that need them (the timer's run gets only the YouTube token). No secret is ever a plain file on the VM, an
+  argument on a command line, or printed. (The Desktop client JSON is deliberately a file, see step 3.)
 - **`PUBLIC_URL` must be exact.** Every write (tick, save, Check now, sign-out) is refused with 403 unless the
   browser's `Origin` header equals `PUBLIC_URL`. Google sign-in also builds its redirect address from it. Set it to
   the address the browser shows, for example `https://VM-NAME.tail1234.ts.net`, with no port and no trailing
@@ -90,7 +91,52 @@ tailscale version                     # 1.52 or newer for the serve syntax below
 tailscale serve status                # what this VM already publishes
 ```
 
-If systemd is older than 250 (Ubuntu 22.04 has 249), stop: the encrypted credentials need a newer distro.
+If systemd is older than 250 (Ubuntu 22.04 has 249), `setup.sh` refuses to run, because `LoadCredentialEncrypted=`
+needs 250. The options, best first:
+
+1. **Upgrade the distro** (preferred): `sudo do-release-upgrade` from Ubuntu 22.04 to 24.04 (systemd 255), or
+   rebuild the VM on Ubuntu 24.04 or Oracle Linux 9.
+2. **Fallback for 249: plain credentials.** The secrets become root-only 0600 files under `/etc/ytps/creds`, which
+   systemd copies into the service with plain `LoadCredential=`. They are still unreadable to the `ytps` user and to
+   anything else not running as root. Compared with `systemd-creds`, the only loss is protection of a copy of the boot
+   volume (a backup or a detached disk), because the files are no longer encrypted with the VM's host key.
+   - Run setup with `sudo YTPS_PLAIN_CREDENTIALS=1 bash setup.sh`.
+   - Instead of `setup.sh secret NAME` and `setup.sh session-key` in step 4, write each file from a hidden prompt:
+
+     ```bash
+     sudo bash -c 'umask 077; read -rsp "Paste NAME: " v; echo >&2; printf "%s" "$v" > /etc/ytps/creds/NAME'
+     sudo bash -c 'umask 077; head -c 32 /dev/urandom | base64 | tr -d "\n=" | tr "+/" "-_" > /etc/ytps/creds/session-key'
+     ```
+
+     The refresh token comes from the laptop keychain over SSH stdin instead of a prompt (laptop):
+
+     ```bash
+     py -3.12 -m uv run --no-sync python -c "import sys; from app import auth, secretstore; sys.stdout.write(secretstore.get(auth.REFRESH_TOKEN) or '')" \
+       | ssh HOST "sudo -n bash -c 'umask 077; cat > /etc/ytps/creds/refresh-token'"
+     ```
+
+   - Point the units at the plain files with drop-ins, which survive every `deploy/push.sh`.
+     `sudo systemctl edit ytps` and add:
+
+     ```
+     [Service]
+     LoadCredentialEncrypted=
+     LoadCredential=refresh-token:/etc/ytps/creds/refresh-token
+     LoadCredential=login-client-secret:/etc/ytps/creds/login-client-secret
+     LoadCredential=session-key:/etc/ytps/creds/session-key
+     ```
+
+     `sudo systemctl edit ytps-run` and add:
+
+     ```
+     [Service]
+     LoadCredentialEncrypted=
+     LoadCredential=refresh-token:/etc/ytps/creds/refresh-token
+     ```
+
+     The empty `LoadCredentialEncrypted=` clears the encrypted entries from the main unit. `setup.sh check` does not
+     apply; instead `sudo ls -l /etc/ytps/creds` must show three non-empty files owned by root with mode
+     `-rw-------`.
 
 ### 2. Run setup.sh
 
@@ -98,9 +144,9 @@ If systemd is older than 250 (Ubuntu 22.04 has 249), stop: the encrypted credent
 
 **VM:** `sudo bash setup.sh`
 
-It creates the system user `ytps`, the directories in the table above, installs uv (pinned in the script) and
-Python 3.12, creates the `systemd-creds` host key, and writes the `/etc/ytps/env` template. Running it again is
-safe and keeps an existing env file.
+It creates the system user `ytps`, the directories in the table above, installs uv (the laptop's version, pinned
+with its release checksum) and Python 3.12, creates the `systemd-creds` host key, and writes the `/etc/ytps/env`
+template. Running it again is safe and keeps an existing env file.
 
 ### 3. Push the app
 
@@ -119,10 +165,11 @@ redeploy.
 The second copies the **Desktop** OAuth client JSON (the one `auth` used on the laptop, at
 `~/.config/youtube-playlist-sorter/client_secret.json`) to `/etc/ytps/client_secret.json`. The YouTube refresh token
 only works together with this client. Google treats a Desktop client's secret as not confidential, so it is a
-readable file rather than a credential.
+root:ytps 0640 file rather than a credential.
 
-If `uv sync --frozen` on the VM complains about the lock file, rerun setup with the laptop's uv version:
-`sudo UV_VERSION=<version from 'py -3.12 -m uv --version'> bash /opt/ytps/deploy/setup.sh`.
+`push.sh` ships the working tree, so it refuses to run with uncommitted changes. Commit first, or add `--force` for a
+deliberate test of uncommitted code. At run time the services start `/opt/ytps-venv/bin/python` directly; uv is used
+only at deploy time.
 
 ### 4. Import the secrets
 
@@ -196,7 +243,7 @@ LOGIN_CLIENT_ID=<client id from step 6>
 ```
 
 `OWNER_EMAIL` defaults to the owner's address. Then `sudo bash /opt/ytps/deploy/setup.sh check`: every line must say
-`ok` before you go on.
+`ok` before you go on. Leave `REAL_RUNS_DISABLED` unset here: the VM is the one machine that does real runs.
 
 ### 8. Start the services
 
@@ -207,6 +254,9 @@ sudo systemctl enable --now ytps.service ytps-run.timer
 systemctl status ytps --no-pager
 systemctl list-timers ytps-run.timer
 ```
+
+A fresh VM has no rules yet (`/var/lib/ytps/mine.yaml` does not exist). Until rules are saved, every timer run and
+Check now just reports "No rules yet. Create them in the Rules tab." and changes nothing.
 
 ### 9. Check it
 
@@ -222,12 +272,35 @@ systemctl list-timers ytps-run.timer
    ```
 
    Expect **403** in Tailscale mode, because `tailscale serve` replaces the forged header with that device's real
-   login. Google mode ignores the header and answers **401**. A **200** means the header got through: stop the
-   service (`sudo systemctl stop ytps`) and find out why before going on.
-5. **Owner's phone:** pick the queue playlist (Queue tab, type its name to confirm). Press **Check now** and wait
-   for the result. Add a test video to the queue playlist by hand in the YouTube app, refresh, tick it, and check it
-   is gone from the playlist in YouTube.
-6. **VM:** `journalctl -u ytps -u ytps-run --since today` shows no errors.
+   login. Google mode ignores the header and answers **401**. With the optional ACL applied, a connection timeout
+   (`000` after `curl --max-time 10`) also passes: that device cannot reach the VM's port at all. A **200** means
+   the header got through: stop the service (`sudo systemctl stop ytps`) and find out why before going on.
+5. **Owner's phone:** pick the queue playlist (Queue tab, type its name to confirm).
+6. **Rules.** Create the rules in the Rules tab and Save, or copy the laptop's graph once (laptop):
+   `ssh HOST "sudo -n -u ytps tee /var/lib/ytps/mine.yaml >/dev/null" < graphs/mine.yaml`. Press **Preview** in the
+   Rules tab first: it is a dry run.
+7. **Owner's phone:** press **Check now** and wait for the result. It reports what was filed, not "No rules yet". Add a
+   test video to the queue playlist by hand in the YouTube app, refresh, tick it, and check it is gone from the
+   playlist in YouTube.
+8. **VM:** `journalctl -u ytps -u ytps-run --since today` shows no errors.
+
+### 10. Stop real runs on the laptop
+
+The laptop and the VM keep separate `state.db` files, so a real run on the laptop would file the same videos into
+the real playlists a second time. Once step 9 passes, on the laptop (PowerShell or cmd):
+
+```bat
+schtasks /Delete /TN "YouTube Playlist Sorter" /F
+```
+
+and add this line to the laptop's `.env` at the repo root:
+
+```
+REAL_RUNS_DISABLED=true
+```
+
+From then on `run` without `--dry-run` on the laptop refuses with exit code 5, and so does Check now in a local UI.
+Use the laptop only for `run --dry-run`, `preview` and development.
 
 ### Tailscale mode
 
@@ -240,8 +313,8 @@ AUTH_MODE=tailscale
 OWNER_TAILSCALE_LOGIN=<owner-login>
 ```
 
-`PUBLIC_URL` stays required. The units load all three credentials and refuse to start if a file is missing, so
-without a Web client store a placeholder: `sudo bash /opt/ytps/deploy/setup.sh secret login-client-secret` and type
+`PUBLIC_URL` stays required. `ytps.service` loads all three credentials and refuses to start if a file is missing,
+so without a Web client store a placeholder (`setup.sh check` points this out): `sudo bash /opt/ytps/deploy/setup.sh secret login-client-secret` and type
 `unused`. Restart with `sudo systemctl restart ytps`. The Account section of the Activity tab
 then says sign-out doesn't apply. Requests from tagged devices carry no identity and are refused.
 
@@ -249,9 +322,8 @@ then says sign-out doesn't apply. Requests from tagged devices carry no identity
 
 - **Logs:** `journalctl -u ytps -u ytps-run -f`. The server logs no request lines (callback URLs carry sign-in
   codes) and errors only by type.
-- **Rules:** edit them in the Rules tab. They are saved to `/var/lib/ytps/mine.yaml`, the file the timer runs. To
-  start from the laptop's graph once:
-  `ssh HOST "sudo -n -u ytps tee /var/lib/ytps/mine.yaml >/dev/null" < graphs/mine.yaml`.
+- **Rules:** edit them in the Rules tab. They are saved to `/var/lib/ytps/mine.yaml`, the file the timer runs.
+  Without that file a run does nothing and says "No rules yet".
 - **Schedule:** every 6 hours with up to 10 minutes of random delay, plus one catch-up run after downtime. To change
   it: `sudo systemctl edit ytps-run.timer` and override `OnCalendar=`.
 - **Run now from the VM:** `sudo systemctl start ytps-run.service`.
@@ -261,9 +333,12 @@ then says sign-out doesn't apply. Requests from tagged devices carry no identity
   `sudo systemctl restart ytps`.
 - **Sign out everywhere:** the Account section at the bottom of the Activity tab. A new session key also signs out
   every device: `sudo bash /opt/ytps/deploy/setup.sh session-key && sudo systemctl restart ytps`.
-- **If the service will not start** with `status=31/SYS` or a memory-mapping error in the journal, a library needs
-  writable and executable memory. Run `sudo systemctl edit ytps ytps-run`, add `[Service]` and
-  `MemoryDenyWriteExecute=no`, and report it.
+- **If the service fails with "Operation not permitted" (EPERM) from `mmap` or `mprotect`, or a `MemoryError` from
+  ctypes**, a library needs memory that is writable and executable, which `MemoryDenyWriteExecute=yes` forbids. Run
+  `sudo systemctl edit ytps` (and `ytps-run`), add `[Service]` and `MemoryDenyWriteExecute=no`, and report it.
+- **If systemd rejects a sandbox directive** ("Unknown key name" or "Failed to parse" in
+  `journalctl -u ytps` or `systemctl status ytps`), the VM's systemd is older than that directive. Comment the line
+  out in `deploy/ytps.service` and `deploy/ytps-run.service`, push again, and report it.
 
 ## Revoking everything
 

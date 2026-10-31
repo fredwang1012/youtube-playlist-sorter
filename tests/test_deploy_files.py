@@ -21,7 +21,23 @@ SANDBOX = {
     "ReadWritePaths": "/var/lib/ytps",
     "RestrictAddressFamilies": "AF_INET AF_INET6 AF_UNIX",
     "MemoryDenyWriteExecute": "yes",
+    "PrivateDevices": "yes",
+    "ProtectKernelTunables": "yes",
+    "ProtectKernelModules": "yes",
+    "ProtectKernelLogs": "yes",
+    "ProtectControlGroups": "yes",
+    "ProtectClock": "yes",
+    "ProtectHostname": "yes",
+    "ProtectProc": "invisible",
+    "RestrictNamespaces": "yes",
+    "RestrictSUIDSGID": "yes",
+    "LockPersonality": "yes",
+    "SystemCallArchitectures": "native",
+    "SystemCallFilter": "@system-service",
+    "CapabilityBoundingSet": "",  # empty: no capabilities at all
 }
+# the web service signs people in; a timer run only needs the YouTube token
+UNIT_CREDENTIALS = {"ytps.service": CREDENTIALS, "ytps-run.service": ("refresh-token",)}
 SERVICES = ("ytps.service", "ytps-run.service")
 
 
@@ -69,8 +85,9 @@ def test_units_have_sandboxing_and_credentials(name):
     assert env["SECRETS_BACKEND"] == "systemd"
     assert env["DATA_DIR"] == "/var/lib/ytps"
     assert env["GRAPH_PATH"] == "/var/lib/ytps/mine.yaml"  # the UI edits the file the timer runs
-    assert {k for k in env if not k.startswith(("UV_", "PYTHON"))} <= setting_names()
-    assert sorted(service["LoadCredentialEncrypted"]) == sorted(f"{c}:/etc/ytps/creds/{c}.cred" for c in CREDENTIALS)
+    assert {k for k in env if not k.startswith("PYTHON")} <= setting_names()
+    assert sorted(service["LoadCredentialEncrypted"]) == sorted(
+        f"{c}:/etc/ytps/creds/{c}.cred" for c in UNIT_CREDENTIALS[name])
     for key, value in SANDBOX.items():
         assert service[key] == [value], key
     assert "AF_NETLINK" not in service["RestrictAddressFamilies"][0]
@@ -80,16 +97,16 @@ def test_serve_and_run_commands():
     serve = unit("ytps.service")["Service"]["ExecStart"]
     run = unit("ytps-run.service")["Service"]["ExecStart"]
     assert len(serve) == len(run) == 1
-    assert re.fullmatch(r"/usr/local/bin/uv run .*python -m app\.cli serve", serve[0])
-    assert re.fullmatch(r"/usr/local/bin/uv run .*python -m app\.cli run --graph /var/lib/ytps/mine\.yaml", run[0])
-    assert "--no-sync" in serve[0] and "--no-sync" in run[0]  # the code directory is read-only to the service
+    # the venv's python directly, so uv is not in the runtime path
+    assert serve == ["/opt/ytps-venv/bin/python -m app.cli serve"]
+    assert run == ["/opt/ytps-venv/bin/python -m app.cli run --graph /var/lib/ytps/mine.yaml"]
     assert unit("ytps-run.service")["Service"]["Type"] == ["oneshot"]
     assert unit("ytps.service")["Install"]["WantedBy"] == ["multi-user.target"]
     assert "Install" not in unit("ytps-run.service")  # started only by the timer
 
 
-def test_services_share_credentials_and_sandbox():
-    shared = ("User", "Group", "EnvironmentFile", "Environment", "LoadCredentialEncrypted", "WorkingDirectory", *SANDBOX)
+def test_services_share_settings_and_sandbox():
+    shared = ("User", "Group", "EnvironmentFile", "Environment", "WorkingDirectory", *SANDBOX)
     serve, run = unit("ytps.service")["Service"], unit("ytps-run.service")["Service"]
     for key in shared:
         assert sorted(serve.get(key, [])) == sorted(run.get(key, [])), key
@@ -132,6 +149,8 @@ def test_setup_script_creates_user_and_never_echoes_secrets():
     for credential in CREDENTIALS:
         assert credential in script
     assert "systemd-creds setup" in script
+    assert "\nUV_VERSION=0.13.5\n" in script and "sha256sum --check" in script
+    assert "astral.sh" not in script  # a checksummed release tarball, not a piped installer
     assert re.search(r"\b250\b", script), "LoadCredentialEncrypted needs systemd 250"
 
 
@@ -147,14 +166,16 @@ def test_setup_env_template_uses_real_settings():
 
 def test_push_excludes_data_and_git():
     script = text("push.sh")
-    for pattern in (".git", "./data", "node_modules", ".venv", "./.env", "__pycache__", "./graphs/mine.yaml",
-                    "client_secret*.json", "token*.json", "./.[!.]*"):
+    for pattern in (".git", "./data", "node_modules", ".venv", ".env", "__pycache__", "./graphs/mine.yaml",
+                    "client_secret*.json", "credentials*.json", "token*.json", "*.db", "*.sqlite", "dist",
+                    "./.[!.]*"):
         assert f"--exclude='{pattern}'" in script, pattern
     assert "npm run build" in script
     assert "app/web/static/index.html" in script  # refuses to ship without the built UI
     assert re.search(r"uv sync --frozen --no-dev", script, re.I)  # "$REMOTE_UV sync": the lock decides, no resolve
     assert "systemctl try-restart" in script
     assert "sudo -n" in script  # fail fast instead of a password prompt fighting the piped stdin
+    assert 'git -C "$ROOT" status --porcelain' in script and "--force" in script  # ships only committed code
 
 
 def test_push_moves_refresh_token_on_stdin():

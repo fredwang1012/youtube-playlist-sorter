@@ -15,19 +15,15 @@ Environment=SECRETS_BACKEND=systemd
 Environment=DATA_DIR=/var/lib/ytps
 Environment=GRAPH_PATH=/var/lib/ytps/mine.yaml
 Environment=CLIENT_SECRET_PATH=/etc/ytps/client_secret.json
-Environment=UV_PROJECT_ENVIRONMENT=/opt/ytps-venv
-Environment=UV_PYTHON_INSTALL_DIR=/opt/ytps-python
-Environment=UV_PYTHON_DOWNLOADS=never
-Environment=UV_CACHE_DIR=/var/lib/ytps/.cache/uv
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
+# only the YouTube token: a run needs no sign-in secrets
 LoadCredentialEncrypted=refresh-token:/etc/ytps/creds/refresh-token.cred
-LoadCredentialEncrypted=login-client-secret:/etc/ytps/creds/login-client-secret.cred
-LoadCredentialEncrypted=session-key:/etc/ytps/creds/session-key.cred
-ExecStart=/usr/local/bin/uv run --no-sync python -m app.cli run --graph /var/lib/ytps/mine.yaml
+ExecStart=/opt/ytps-venv/bin/python -m app.cli run --graph /var/lib/ytps/mine.yaml
 TimeoutStartSec=30min
 UMask=0077
 
+# sandbox; if this systemd rejects a directive, comment it out and report it (docs/REMOTE.md)
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -35,3 +31,17 @@ PrivateTmp=yes
 ReadWritePaths=/var/lib/ytps
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 MemoryDenyWriteExecute=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=

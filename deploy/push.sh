@@ -2,13 +2,20 @@
 # Ships the app from the laptop to the VM. Run from Git Bash at the repo root; HOST is the SSH destination,
 # e.g. ubuntu@VM-NAME. The VM user needs passwordless sudo (the default on Oracle images). See docs/REMOTE.md.
 #
-#   deploy/push.sh HOST                  build the UI, copy the app to /opt/ytps, install the units, restart
+#   deploy/push.sh HOST [--force]        build the UI, copy the app to /opt/ytps, install the units, restart;
+#                                        refuses uncommitted changes unless --force
 #   deploy/push.sh HOST refresh-token    move the YouTube refresh token from this laptop's keychain into the VM's
 #                                        encrypted credential, over SSH stdin (never a file, never on screen)
 #   deploy/push.sh HOST desktop-client   copy the Desktop OAuth client JSON to /etc/ytps/client_secret.json
 set -euo pipefail
 
-HOST=${1:?usage: deploy/push.sh HOST [refresh-token | desktop-client]}
+FORCE=0
+ARGS=()
+for arg in "$@"; do
+  if [[ $arg == --force ]]; then FORCE=1; else ARGS+=("$arg"); fi
+done
+set -- "${ARGS[@]}"
+HOST=${1:?usage: deploy/push.sh HOST [refresh-token | desktop-client] [--force]}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 UV=(py -3.12 -m uv)
 REMOTE_UV="UV_PROJECT_ENVIRONMENT=/opt/ytps-venv UV_PYTHON_INSTALL_DIR=/opt/ytps-python UV_PYTHON_DOWNLOADS=never UV_CACHE_DIR=/var/cache/ytps-uv /usr/local/bin/uv"
@@ -19,6 +26,11 @@ die() {
 }
 
 deploy() {
+  # the working tree is what ships, so ship only what is committed
+  if [[ -n $(git -C "$ROOT" status --porcelain) ]] && ((!FORCE)); then
+    git -C "$ROOT" status --short >&2
+    die "uncommitted changes (listed above); commit them or rerun with --force"
+  fi
   (cd "$ROOT/web" && { [[ -d node_modules ]] || npm ci; } && npm run build)
   [[ -f $ROOT/app/web/static/index.html ]] || die "the UI build did not produce app/web/static/index.html"
 
@@ -26,8 +38,9 @@ deploy() {
   # Patterns starting with ./ match only at the repo root.
   tar -C "$ROOT" -czf - \
     --exclude='.git' --exclude='./data' --exclude='node_modules' --exclude='.venv' --exclude='__pycache__' \
-    --exclude='.pytest_cache' --exclude='./.env' --exclude='./graphs/mine.yaml' --exclude='./secrets' \
-    --exclude='client_secret*.json' --exclude='token*.json' --exclude='./.[!.]*' \
+    --exclude='.pytest_cache' --exclude='.env' --exclude='./graphs/mine.yaml' --exclude='./secrets' \
+    --exclude='client_secret*.json' --exclude='credentials*.json' --exclude='token*.json' --exclude='*.db' \
+    --exclude='*.sqlite' --exclude='dist' --exclude='./.[!.]*' \
     . |
     ssh "$HOST" "sudo -n bash -c '
       set -euo pipefail
