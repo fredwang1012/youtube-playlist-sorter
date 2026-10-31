@@ -1,7 +1,8 @@
 """The watch queue: one owned playlist, listed from YouTube with a short cache, where a tick removes the item.
 
-tick is the only caller of playlistItems.delete. It refuses any item whose playlist is not the saved queue playlist,
-checked against state immediately before the call. Every other playlist stays insert-only.
+tick is the only caller of playlistItems.delete. It deletes an item only when that item id is in a listing of the saved
+queue playlist (fetched from YouTube, never taken from the caller) with the expected video id. Every other playlist
+stays insert-only.
 """
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -10,7 +11,7 @@ from typing import Any, Literal, Protocol
 from app.detect import parse_duration
 from app.run import quota_day
 from app.state import State
-from app.youtube import DELETE_COST, NotFoundError, QuotaMeter, YouTubeAPI
+from app.youtube import DELETE_COST, NotFoundError, YouTubeAPI
 
 QUEUE_KEY = "queue_playlist"  # kv key holding the saved queue playlist id
 
@@ -116,31 +117,53 @@ def list_queue(yt: YouTubeAPI, state: State, now: datetime, max_age: timedelta =
     return items
 
 
-def tick(
-    yt: YouTubeAPI, state: State, meter: QuotaMeter, now: datetime, item: ItemRef, budget_ceiling: int
-) -> TickResult:
-    """Remove a watched item from the queue playlist. A 404 means it was already removed elsewhere: success.
+def _find(items: list[QueueItem], item_id: str, playlist_id: str) -> QueueItem | None:
+    return next((i for i in items if i.item_id == item_id and i.playlist_id == playlist_id), None)
 
-    Never touches the filed or seen records, so a ticked video is never filed again.
-    """
-    invalidate()
-    day = quota_day(now)
+
+def _ceiling_check(state: State, day: str, budget_ceiling: int) -> None:
     used = state.quota_used(day)
     if used + DELETE_COST > budget_ceiling:
         raise QuotaCeilingError(
             f"Today's YouTube quota is nearly used up ({used} of {budget_ceiling} units); "
             "ticks work again after midnight Pacific time."
         )
-    before = meter.total
+
+
+def tick(yt: YouTubeAPI, state: State, now: datetime, item: ItemRef, budget_ceiling: int) -> TickResult:
+    """Remove a watched item from the queue playlist.
+
+    playlistItems.delete takes only an item id, so the caller's playlist_id proves nothing. The delete is sent only
+    when item_id appears in a listing of the saved queue playlist (the cache, else one fresh fetch) with the same
+    video id. An id not in the queue, or a 404 from the delete (removed elsewhere since the listing), is
+    "already_gone" either way. Listing reads are charged by list_queue; the delete's units are charged here.
+    Never touches the filed or seen records, so a ticked video is never filed again.
+    """
+    day = quota_day(now)
     try:
-        # the allow-list: delete only from the queue playlist saved right now
         saved = get_queue_playlist(state)
-        if not saved or not item.playlist_id or item.playlist_id != saved:
+        # a quick refusal for a UI showing an old queue; not what authorises the delete
+        if not saved or item.playlist_id != saved:
             raise QueueError("queue changed, refresh")
-        yt.remove_playlist_item(item.item_id)
-        return "removed"
-    except NotFoundError:
-        return "already_gone"
+        _ceiling_check(state, day, budget_ceiling)
+        before = yt.meter.total
+        found = _find(list_queue(yt, state, now), item.item_id, saved)
+        if found is None and yt.meter.total == before:  # cache hit without the item: fetch once more
+            found = _find(list_queue(yt, state, now, max_age=timedelta(0)), item.item_id, saved)
+        if found is None:
+            return "already_gone"
+        if found.video_id != item.video_id:
+            raise QueueError("queue changed, refresh")
+        _ceiling_check(state, day, budget_ceiling)  # the listing may have spent units
+        if get_queue_playlist(state) != saved:
+            raise QueueError("queue changed, refresh")
+        before = yt.meter.total
+        try:
+            yt.remove_playlist_item(found.item_id)
+            return "removed"
+        except NotFoundError:
+            return "already_gone"
+        finally:
+            _charge(state, day, yt.meter.total - before)
     finally:
-        _charge(state, day, meter.total - before)
         invalidate()

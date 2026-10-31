@@ -56,7 +56,7 @@ def ref(item_id, video_id, playlist_id):
 
 
 def tick(yt, state, item, ceiling=CEILING):
-    return queue.tick(yt, state, yt.meter, NOW, item, ceiling)
+    return queue.tick(yt, state, NOW, item, ceiling)
 
 
 # --- RealYouTube additions ---
@@ -208,15 +208,68 @@ def test_tick_refused_when_queue_changed(state):
     assert "delete" not in yt.calls and yt.deletes == []
 
 
+def test_tick_refuses_item_from_other_playlist(state):
+    """The caller's playlist_id is not trusted: delete takes only an item id."""
+    with_queue(state, PLB)
+    yt = yt_with(PLB)
+    on_a = pl_item("itemOnPLA", "vA", PLA, "2026-10-25T12:00:00Z")
+    yt.queues[PLA] = [on_a]
+    queue.list_queue(yt, state, NOW)
+    assert tick(yt, state, ref("itemOnPLA", "vA", PLB)) == "already_gone"
+    assert "delete" not in yt.calls and yt.deletes == []
+    assert yt.queues[PLA] == [on_a]
+
+
+def test_tick_video_mismatch_refused(state):
+    with_queue(state)
+    yt = yt_with()
+    queue.list_queue(yt, state, NOW)
+    with pytest.raises(QueueError, match="queue changed, refresh"):
+        tick(yt, state, ref("item2", "v1", PLB))
+    assert "delete" not in yt.calls and len(yt.queues[PLB]) == 2
+
+
+def test_tick_fresh_refetch_on_cache_miss(state):
+    with_queue(state)
+    yt = yt_with()
+    queue.list_queue(yt, state, NOW)  # cached without the new item
+    yt.queues[PLB] += [pl_item(f"x{i}", f"x{i}", PLB, "2026-10-28T12:00:00Z") for i in range(50)]  # 52 items
+    yt.calls.clear()
+    before = state.quota_used(DAY)
+    assert tick(yt, state, ref("x7", "x7", PLB)) == "removed"
+    assert yt.calls == ["queue_items", "queue_items", "videos", "delete"]  # 2 pages + 1 videos call, once
+    assert state.quota_used(DAY) == before + 3 + DELETE_COST and yt.deletes == ["x7"]
+
+
+def test_tick_cold_cache_fetches_once(state):
+    with_queue(state)
+    yt = yt_with()
+    assert tick(yt, state, ref("nope", "v9", PLB)) == "already_gone"
+    assert yt.calls == ["queue_items", "videos"]  # a fresh listing is not fetched twice
+    assert state.quota_used(DAY) == 2
+
+
+def test_tick_unknown_item_after_refetch_is_already_gone_no_delete(state):
+    with_queue(state)
+    yt = yt_with()
+    queue.list_queue(yt, state, NOW)
+    yt.calls.clear()
+    assert tick(yt, state, ref("nope", "v9", PLB)) == "already_gone"
+    assert yt.calls == ["queue_items", "videos"] and yt.deletes == []
+    assert state.quota_used(DAY) == 4  # two listings, each charged once
+
+
 def test_tick_respects_ceiling(state):
     with_queue(state)
     yt = yt_with()
-    state.add_quota(DAY, 9460)
+    queue.list_queue(yt, state, NOW)  # listing cached: the tick costs only the delete
+    state.add_quota(DAY, 9460 - state.quota_used(DAY))
     with pytest.raises(QuotaCeilingError):
         tick(yt, state, ref("item1", "v1", PLB))
-    assert yt.calls == [] and state.quota_used(DAY) == 9460
+    assert "delete" not in yt.calls and state.quota_used(DAY) == 9460
 
-    state.add_quota(DAY, -10)  # 9450 used: 9450 + 50 <= 9500
+    queue.list_queue(yt, state, NOW)
+    state.add_quota(DAY, 9450 - state.quota_used(DAY))  # 9450 + 50 <= 9500
     assert tick(yt, state, ref("item1", "v1", PLB)) == "removed"
     assert state.quota_used(DAY) == 9500
 
@@ -230,20 +283,23 @@ def test_inserts_still_stop_at_budget(state):
 
 
 def test_delete_never_called_for_other_playlists(state):
-    ids = [PLA, PLB, PL1, "PLcccccccccc", "", None]
+    playlists = [PLA, PLB, PL1, "PLcccccccccc"]
+    claims = playlists + ["", None]
     for saved in [PLA, PLB, None]:
         if saved:
             with_queue(state, saved)
         else:
             state.kv_delete(queue.QUEUE_KEY)
-        for target in ids:
-            yt = FakeYT()
-            yt.queues = {p: [pl_item("item", "v", p, "2026-10-25T12:00:00Z")] for p in ids if p}
-            try:
-                result = tick(yt, state, ref("item", "v", target))
-            except QueueError:
-                result = None
-            if saved is not None and target == saved:
-                assert result == "removed" and yt.deletes == ["item"]
-            else:
-                assert result is None and "delete" not in yt.calls, (saved, target)
+        for home in playlists:  # where the item really lives
+            for claimed in claims:  # what the caller says
+                yt = FakeYT()
+                yt.queues = {p: [pl_item(f"item-{p}", f"v-{p}", p, "2026-10-25T12:00:00Z")] for p in playlists}
+                try:
+                    result = tick(yt, state, ref(f"item-{home}", f"v-{home}", claimed))
+                except QueueError:
+                    result = None
+                if saved is not None and home == saved and claimed == saved:
+                    assert result == "removed" and yt.deletes == [f"item-{saved}"]
+                else:
+                    assert "delete" not in yt.calls and yt.deletes == [], (saved, home, claimed)
+                    assert result in (None, "already_gone")
