@@ -19,7 +19,7 @@ from tests.test_run import NOW, FakeYT, fetcher
 PUBLIC = "https://vm.example.ts.net"
 CLIENT_ID = "client-123.apps.googleusercontent.com"
 OWNER = "owner@example.com"
-OWNER_TS = "fredwang1012@github"
+OWNER_TS = "owner@github"
 LOGIN_SECRET = "LOGIN-CLIENT-SECRET-MARKER-7f3a"
 WRITE = {"Origin": PUBLIC}  # json= sets the JSON content type
 

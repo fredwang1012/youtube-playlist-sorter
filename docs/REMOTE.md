@@ -240,9 +240,10 @@ If Google refuses the `ts.net` redirect URI, use Tailscale mode instead (see "Ta
 PUBLIC_URL=https://<vm>.<tailnet>.ts.net
 AUTH_MODE=google
 LOGIN_CLIENT_ID=<client id from step 6>
+OWNER_EMAIL=<the one Google account allowed to sign in>
 ```
 
-`OWNER_EMAIL` defaults to the owner's address. Then `sudo bash /opt/ytps/deploy/setup.sh check`: every line must say
+`OWNER_EMAIL` has no default: the server refuses to start in Google mode without it. Then `sudo bash /opt/ytps/deploy/setup.sh check`: every line must say
 `ok` before you go on. Leave `REAL_RUNS_DISABLED` unset here: the VM is the one machine that does real runs.
 
 ### 8. Start the services

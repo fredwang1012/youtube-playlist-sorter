@@ -63,7 +63,7 @@ def test_server_setting_defaults(monkeypatch):
     assert s.secrets_backend == "keyring"
     assert s.credentials_dir is None
     assert s.auth_mode == "google"
-    assert s.owner_email == "owner@example.com"
+    assert s.owner_email == ""
     assert s.owner_tailscale_login == ""
     assert s.public_url == "http://127.0.0.1:8765"
     assert s.bind_port == 8765
