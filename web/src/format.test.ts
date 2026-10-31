@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { duration, relative } from "./format";
+import { duration, relative, safeThumbnail } from "./format";
 
 describe("format", () => {
   it("formats durations as m:ss or h:mm:ss", () => {
@@ -17,5 +17,19 @@ describe("format", () => {
     expect(relative("2026-10-30T07:00:00Z", now)).toBe("5h ago");
     expect(relative("2026-10-27T12:00:00Z", now)).toBe("3d ago");
     expect(relative("", now)).toBe("");
+  });
+
+  it("keeps only https thumbnails from YouTube's image hosts", () => {
+    expect(safeThumbnail("https://i.ytimg.com/vi/abc/mqdefault.jpg")).toBe("https://i.ytimg.com/vi/abc/mqdefault.jpg");
+    expect(safeThumbnail("https://i9.ytimg.com/vi/abc/mq.jpg")).toBe("https://i9.ytimg.com/vi/abc/mq.jpg");
+    expect(safeThumbnail("https://yt3.ggpht.com/a/b=s88")).toBe("https://yt3.ggpht.com/a/b=s88");
+    expect(safeThumbnail("http://i.ytimg.com/vi/abc/mq.jpg")).toBeNull();
+    expect(safeThumbnail("https://evil.example/ytimg.com.jpg")).toBeNull();
+    expect(safeThumbnail("https://notytimg.com/x.jpg")).toBeNull();
+    expect(safeThumbnail("https://i.ytimg.com.evil.example/x.jpg")).toBeNull();
+    expect(safeThumbnail("javascript:alert(1)")).toBeNull();
+    expect(safeThumbnail("not a url")).toBeNull();
+    expect(safeThumbnail("")).toBeNull();
+    expect(safeThumbnail(null)).toBeNull();
   });
 });

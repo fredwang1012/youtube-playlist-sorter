@@ -1,9 +1,10 @@
 // Queue tab: the queue playlist as compact rows. A row opens the video; ✓ removes it from the queue on YouTube.
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { api, ApiError, type Activity, type Playlist, type QueueItem, type QueueResponse } from "./api";
-import { duration, relative } from "./format";
+import { duration, relative, safeThumbnail } from "./format";
 
 const POLL_MS = 3000;
+const POLL_LIMIT_MS = 10 * 60 * 1000; // the button stops waiting on a check after 10 minutes
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -11,6 +12,11 @@ function sleep(ms: number): Promise<void> {
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+// only https images from YouTube's hosts; anything else would also be blocked by the server's CSP
+function thumbnail(item: QueueItem): string | undefined {
+  return safeThumbnail(item.thumbnail) ?? undefined;
 }
 
 function tickError(err: unknown): string {
@@ -60,6 +66,7 @@ export default function Queue({ active }: { active: boolean }) {
   const waitForRun = useCallback(async () => {
     if (polling.current) return;
     polling.current = true;
+    const deadline = Date.now() + POLL_LIMIT_MS;
     try {
       for (;;) {
         await sleep(POLL_MS);
@@ -67,6 +74,12 @@ export default function Queue({ active }: { active: boolean }) {
         const a = await api.activity();
         if (!a.running) {
           if (alive.current) setRun(runResult(a));
+          break;
+        }
+        if (Date.now() >= deadline) {
+          if (alive.current) {
+            setRun({ running: false, failed: true, text: "The check is taking more than 10 minutes. See Activity for its result." });
+          }
           break;
         }
       }
@@ -210,8 +223,8 @@ export default function Queue({ active }: { active: boolean }) {
                   rel="noreferrer"
                 >
                   <span className="thumb">
-                    {item.thumbnail ? (
-                      <img src={item.thumbnail} alt="" loading="lazy" referrerPolicy="no-referrer" />
+                    {thumbnail(item) ? (
+                      <img src={thumbnail(item)} alt="" loading="lazy" referrerPolicy="no-referrer" />
                     ) : (
                       <span className="thumb-blank" aria-hidden="true" />
                     )}

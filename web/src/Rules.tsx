@@ -36,6 +36,8 @@ import {
 
 type Sheet = "add" | "node" | "settings" | "result" | null;
 
+const TOAST_MS = 2000; // a little longer than the 1.8 s fade
+
 interface Result {
   title: string;
   errors: string[];
@@ -100,6 +102,7 @@ function Editor({ active }: { active: boolean }) {
   const [nodes, setNodes] = useState<RuleNode[]>([]);
   const [edges, setEdges] = useState<Edge[]>([]);
   const [settings, setSettings] = useState<GraphDoc["settings"]>({ multi_match: "all" });
+  const [version, setVersion] = useState(1);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -120,10 +123,12 @@ function Editor({ active }: { active: boolean }) {
         setNodes(f.nodes);
         setEdges(f.edges);
         setSettings(graph.settings);
+        setVersion(typeof graph.version === "number" ? graph.version : 1);
       } else {
         setNodes([]);
         setEdges([]);
         setSettings({ multi_match: "all" });
+        setVersion(1);
       }
       setDirty(false);
       setBadNodes(new Set());
@@ -145,6 +150,14 @@ function Editor({ active }: { active: boolean }) {
     window.addEventListener("beforeunload", warn);
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
+
+  // the toast fades with a CSS animation, but reduced-motion settings or a hidden tab can skip animationend
+  const savedToast = result?.title === "Saved" && !dirty;
+  useEffect(() => {
+    if (!savedToast) return;
+    const t = window.setTimeout(() => setResult((r) => (r?.title === "Saved" ? null : r)), TOAST_MS);
+    return () => window.clearTimeout(t);
+  }, [savedToast, result]);
 
   useEffect(() => {
     if (active && loaded) requestAnimationFrame(() => flow.fitView({ padding: 0.2, maxZoom: 1 }));
@@ -234,7 +247,7 @@ function Editor({ active }: { active: boolean }) {
     setDirty(true);
   }
 
-  const doc = () => fromFlow(nodes, edges, settings);
+  const doc = () => fromFlow(nodes, edges, settings, version);
 
   async function preview() {
     setBusy("preview");
@@ -293,7 +306,7 @@ function Editor({ active }: { active: boolean }) {
         </div>
       </header>
       {dirty && <p className="sr-only" role="status">Unsaved changes</p>}
-      {result?.title === "Saved" && !dirty && (
+      {savedToast && (
         <p className="toast" role="status" onAnimationEnd={() => setResult(null)}>Saved</p>
       )}
       {loadError && (

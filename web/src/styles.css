@@ -195,6 +195,10 @@ h3 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacin
 .quota-mark { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); opacity: 0.5; transform: translateX(-1px); }
 .section { margin: 20px 16px 4px; }
 .runs { list-style: none; margin: 0; padding: 0 16px; }
+.account { padding-bottom: 24px; }
+.account > p { margin: 8px 16px; }
+.account-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 16px; }
+.account-row p { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .run { padding: 12px 0; border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 4px; }
 .run-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; }
 .chip { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; background: var(--surface-2); color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }

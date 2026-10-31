@@ -1,6 +1,6 @@
 // Activity tab: today's quota and the recent runs, newest first.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type Activity as ActivityData, type RunRow } from "./api";
+import { api, type Activity as ActivityData, type Me, type RunRow } from "./api";
 import { clock, relative } from "./format";
 
 const POLL_MS = 3000;
@@ -164,6 +164,54 @@ export default function Activity({ active }: { active: boolean }) {
           )}
         </>
       )}
+      <Account />
     </div>
+  );
+}
+
+function Account() {
+  const [me, setMe] = useState<Me | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    api.me().then((m) => alive && setMe(m), () => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  async function signOut() {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.logout();
+      window.location.reload(); // the reload lands on Google sign-in
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setBusy(false);
+    }
+  }
+
+  if (!me) return null;
+  return (
+    <section className="account" aria-label="Account">
+      <h2 className="section">Account</h2>
+      {me.auth_mode === "google" ? (
+        <div className="account-row">
+          <p className="muted small">Signed in as {me.email}</p>
+          <button type="button" className="btn" onClick={signOut} disabled={busy}>
+            {busy ? "Signing out…" : "Sign out everywhere"}
+          </button>
+        </div>
+      ) : (
+        <p className="muted small">
+          Signed in by Tailscale as {me.email}. Sign-out doesn't apply here: access follows this device being on the
+          tailnet.
+        </p>
+      )}
+      {error && <p className="notice error" role="alert">{error}</p>}
+    </section>
   );
 }

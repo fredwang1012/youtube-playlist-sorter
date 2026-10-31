@@ -72,4 +72,10 @@ describe("graphModel", () => {
     expect(back.settings).toBeUndefined();
     expect(back.nodes.every((n) => n.ui && Number.isInteger(n.ui.x))).toBe(true);
   });
+
+  it("fromFlow keeps the loaded graph version", () => {
+    const { nodes, edges } = toFlow({ ...example, version: 2 });
+    expect(fromFlow(nodes, edges, example.settings, 2).version).toBe(2);
+    expect(fromFlow(nodes, edges, example.settings).version).toBe(1); // a new graph
+  });
 });

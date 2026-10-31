@@ -135,7 +135,7 @@ def build_router(cfg: Settings, deps: "Deps") -> APIRouter:
 
     @router.get("/me")
     def me(email: str = Depends(owner)) -> dict:
-        return {"email": email}
+        return {"email": email, "auth_mode": cfg.auth_mode}  # the UI hides sign-out in Tailscale mode
 
     @router.get("/queue")
     def get_queue() -> dict:

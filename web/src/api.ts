@@ -103,7 +103,15 @@ export interface Activity {
   last_manual: { status: "done" | "already_running" | "error"; message: string; finished_at: string | null } | null;
 }
 
+export interface Me {
+  email: string;
+  auth_mode: "google" | "tailscale";
+}
+
 export const api = {
+  me: () => request<Me>("GET", "/api/me"),
+  // ends the session on every device; the server answers 200 even when already signed out
+  logout: () => request<{ ok: true }>("POST", "/auth/logout"),
   queue: () => request<QueueResponse>("GET", "/api/queue"),
   tick: (item: Pick<QueueItem, "item_id" | "video_id" | "playlist_id">) =>
     request<{ result: string }>("POST", "/api/queue/tick", {

@@ -84,12 +84,46 @@ class _ShortErrors:
                 await JSONResponse({"error": "internal error"}, 500)(scope, receive, send)
 
 
+# the built UI loads only its own script and stylesheet; thumbnails come from YouTube's image hosts, and the only
+# form target outside this origin is Google's sign-in page
+CONTENT_SECURITY_POLICY = "; ".join((
+    "default-src 'self'",
+    "img-src 'self' https://i.ytimg.com https://*.ytimg.com https://*.ggpht.com",
+    "connect-src 'self'",
+    "frame-ancestors 'none'",
+    "base-uri 'none'",
+    "form-action 'self' https://accounts.google.com",
+))
+
+
+class _SecurityHeaders:
+    """Add the Content-Security-Policy header to every HTTP response, error pages included."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def with_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = [(k, v) for k, v in message.get("headers", []) if k.lower() != b"content-security-policy"]
+                headers.append((b"content-security-policy", CONTENT_SECURITY_POLICY.encode("ascii")))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, with_headers)
+
+
 def create_app(settings: Settings, deps: Deps | None = None) -> FastAPI:
     deps = deps or Deps()
     auth = Auth(settings, lambda: deps.now(), deps.verify_id_token, deps.token_transport)
     app = FastAPI(title="youtube-playlist-sorter", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.auth = auth
     app.add_middleware(_ShortErrors)
+    app.add_middleware(_SecurityHeaders)  # added last, so it wraps the bare 500 from _ShortErrors too
 
     @app.exception_handler(NotSignedIn)
     def not_signed_in(request: Request, _err: NotSignedIn) -> Response:

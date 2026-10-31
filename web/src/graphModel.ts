@@ -80,7 +80,8 @@ export function toFlow(doc: GraphDoc): { nodes: RuleNode[]; edges: Edge[] } {
   return { nodes, edges };
 }
 
-export function fromFlow(nodes: RuleNode[], edges: Edge[], settings: GraphDoc["settings"]): GraphDoc {
+/** `version` is the loaded graph's, so saving never rewrites it; a new graph is version 1. */
+export function fromFlow(nodes: RuleNode[], edges: Edge[], settings: GraphDoc["settings"], version = 1): GraphDoc {
   const ids = new Set(nodes.map((n) => n.id));
   const seen = new Set<string>();
   const outEdges: GraphEdge[] = [];
@@ -98,8 +99,8 @@ export function fromFlow(nodes: RuleNode[], edges: Edge[], settings: GraphDoc["s
   });
   // key order matches the YAML files: version, settings, nodes, edges
   return settings === undefined
-    ? { version: 1, nodes: outNodes, edges: outEdges }
-    : { version: 1, settings, nodes: outNodes, edges: outEdges };
+    ? { version, nodes: outNodes, edges: outEdges }
+    : { version, settings, nodes: outNodes, edges: outEdges };
 }
 
 // --- node catalogue ---

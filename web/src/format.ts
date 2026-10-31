@@ -30,3 +30,19 @@ export function clock(iso: string | null | undefined): string {
   if (Number.isNaN(t)) return "";
   return new Date(t).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
+
+const THUMBNAIL_HOSTS = ["ytimg.com", "ggpht.com"];
+
+/** The thumbnail URL when it is https on one of YouTube's image hosts (matching the CSP img-src), else null. */
+export function safeThumbnail(url: string | null | undefined): string | null {
+  if (!url) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:") return null;
+  const host = parsed.hostname.toLowerCase();
+  return THUMBNAIL_HOSTS.some((h) => host === h || host.endsWith(`.${h}`)) ? url : null;
+}

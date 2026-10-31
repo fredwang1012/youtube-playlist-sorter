@@ -257,6 +257,42 @@ def test_static_ui(api, tmp_path):
     assert api.client.get("/api/unknown").status_code == 404
 
 
+# --- content security policy ---
+
+CSP = (
+    "default-src 'self'; "
+    "img-src 'self' https://i.ytimg.com https://*.ytimg.com https://*.ggpht.com; "
+    "connect-src 'self'; "
+    "frame-ancestors 'none'; "
+    "base-uri 'none'; "
+    "form-action 'self' https://accounts.google.com"
+)
+
+
+def test_csp_header_on_ui_api_and_errors(api, tmp_path):
+    static = tmp_path / "static"
+    static.mkdir()
+    (static / "index.html").write_text("<!doctype html><title>ytps</title>", encoding="utf-8")
+
+    def broken():
+        raise RuntimeError("boom")
+
+    responses = [api.client.get("/"), api.client.get("/rules"), api.client.get("/api/me"),
+                 api.client.get("/api/unknown"), api.client.get("/healthz")]
+    api.deps.make_client = broken
+    responses.append(api.client.get("/api/playlists"))  # the bare 500
+    responses.append(api.client.post("/auth/logout", json={}, headers=WRITE))
+    responses.append(api.client.get("/api/me"))  # signed out: 401
+    assert [r.status_code for r in responses] == [200, 200, 200, 404, 200, 500, 200, 401]
+    for r in responses:
+        assert r.headers["content-security-policy"] == CSP, r.request.url
+
+
+def test_csp_header_on_sign_in_pages(env):
+    assert env.client.get("/").headers["content-security-policy"] == CSP  # the redirect to sign-in
+    assert env.client.get("/auth/callback").headers["content-security-policy"] == CSP  # the refused page
+
+
 # --- errors and secrets ---
 
 def test_unexpected_error_is_short_and_logged_by_type(api, caplog):

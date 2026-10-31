@@ -230,7 +230,7 @@ def test_callback_sets_secure_httponly_cookie(env):
     session = next(c for c in r.headers.get_list("set-cookie") if c.startswith("ytps_session="))
     for attr in ("HttpOnly", "Secure", "SameSite=lax", "Max-Age=2592000", "Path=/"):
         assert attr in session, attr
-    assert env.client.get("/api/me").json() == {"email": OWNER}
+    assert env.client.get("/api/me").json() == {"email": OWNER, "auth_mode": "google"}
 
 
 def test_session_expiry(env):
@@ -265,7 +265,7 @@ def test_tailscale_mode_requires_owner_header(web_settings, tmp_path):
         r = c.get("/api/me", headers={"Tailscale-User-Login": "someone-else@github"})
         assert (r.status_code, r.json()) == (403, {"error": "not the owner"})
         r = c.get("/api/me", headers={"Tailscale-User-Login": OWNER_TS})
-        assert (r.status_code, r.json()) == (200, {"email": OWNER_TS})
+        assert (r.status_code, r.json()) == (200, {"email": OWNER_TS, "auth_mode": "tailscale"})
         # a Google session cookie means nothing here, and HTML gets a page, not a redirect loop
         r = c.get("/")
         assert r.status_code == 401 and "location" not in r.headers
