@@ -15,3 +15,7 @@ token*.json
 credentials*.json
 client_secret*.json
 graphs/mine.yaml
+
+# web UI build output and dependencies
+app/web/static/
+web/node_modules/
