@@ -30,6 +30,10 @@ class NotFoundError(YouTubeError):
     pass
 
 
+class ServerError(YouTubeError):
+    """5xx: an insert that fails this way may still have been applied."""
+
+
 class AlreadyInPlaylistError(YouTubeError):
     pass
 
@@ -57,6 +61,7 @@ class YouTubeAPI(Protocol):
     def videos(self, ids: list[str]) -> list[dict[str, Any]]: ...
     def my_playlists(self) -> list[dict[str, Any]]: ...
     def subscriptions(self) -> list[dict[str, Any]]: ...
+    def playlist_contains(self, playlist_id: str, video_id: str) -> bool: ...
     def insert_into_playlist(self, playlist_id: str, video_id: str) -> None: ...
 
 
@@ -82,6 +87,8 @@ def _map_error(err: HttpError, what: str) -> YouTubeError:
         return NotFoundError(f"Not found during {what}.")
     if status == 403:
         return ForbiddenError(f"Forbidden during {what}; check the token scope and playlist ownership.")
+    if status is not None and status >= 500:
+        return ServerError(f"YouTube server error {status} during {what}.")
     return YouTubeError(f"YouTube API error {status} during {what}.")
 
 
@@ -170,6 +177,15 @@ class RealYouTube:
                 part="snippet", mine=True, maxResults=50, pageToken=token
             ),
         )
+
+    def playlist_contains(self, playlist_id: str, video_id: str) -> bool:
+        """Read-only (1 unit): is the video already in the playlist?"""
+        resp = self._run(
+            self._svc.playlistItems().list(part="id", playlistId=playlist_id, videoId=video_id, maxResults=1),
+            "playlistItems.list",
+            READ_COST,
+        )
+        return bool(resp.get("items"))
 
     def insert_into_playlist(self, playlist_id: str, video_id: str) -> None:
         body = {

@@ -18,11 +18,13 @@ from app.rss import Fetcher, fetch_url
 from app.state import State
 from app.youtube import (
     INSERT_COST,
+    READ_COST,
     AlreadyInPlaylistError,
     PlaylistFullError,
     QuotaExceededError,
     QuotaMeter,
     RateLimitedError,
+    ServerError,
     YouTubeAPI,
     YouTubeError,
 )
@@ -95,6 +97,111 @@ def detect_recent(
     return detect_new(channels, yt, state, lambda: now, fetch=fetch, backfill=backfill), subs
 
 
+class _Defer(Exception):
+    """An API call was not made (budget) or was refused (rate limit, quota); the filing waits for the next run."""
+
+
+class _Ctx:
+    """Per-run working state. Quota units are saved to state as they are spent, so a hard kill loses none."""
+
+    def __init__(self, yt, state: State, meter: QuotaMeter, now: datetime, day: str, report: Report, sleep) -> None:
+        self.yt, self.state, self.meter, self.now, self.day = yt, state, meter, now, day
+        self.report, self.sleep = report, sleep
+        self.flushed = 0
+        self.stop = False  # quota error: nothing more can be sent this run
+
+    def used(self) -> int:
+        return self.state.quota_used(self.day) + self.meter.total - self.flushed
+
+    def flush(self) -> None:
+        delta = self.meter.total - self.flushed
+        if delta:
+            self.state.add_quota(self.day, delta)
+            self.flushed = self.meter.total
+
+    def call(self, fn: Callable[[], object], cost: int):
+        """Run an API call under the budget guard with one rate-limit retry (budget re-checked before the retry)."""
+        for attempt in (1, 2):
+            if self.stop or self.used() + cost > self.report.budget:
+                raise _Defer()
+            try:
+                return fn()
+            except RateLimitedError:
+                if attempt == 2:
+                    self.report.errors.append("rate limited; deferred to the next run")
+                    raise _Defer() from None
+                self.sleep(RATE_LIMIT_PAUSE_SECONDS)
+            except QuotaExceededError:
+                self.stop = self.report.quota_stopped = True
+                self.report.errors.append("YouTube quota exceeded; stopped. It resets at midnight Pacific time.")
+                raise _Defer() from None
+            finally:
+                if not self.report.dry_run:
+                    self.flush()
+
+    def file(self, video_id: str, channel_id: str, pid: str) -> tuple[str, str]:
+        """Put one video into one playlist. Returns (status, message): done, queued (still pending), failed or full."""
+        st, rep, now = self.state, self.report, self.now
+        if st.is_filed(video_id, pid):
+            st.drop_pending(video_id, pid)
+            rep.already += 1
+            return "done", ""
+        if pid in rep.full_playlists:
+            return "full", ""
+        label = f"{video_id} -> {rep.titles.get(pid, pid)}"
+        try:
+            if st.pending_attempts(video_id, pid):  # an earlier attempt may have been accepted: look before inserting
+                try:
+                    present = self.call(lambda: self.yt.playlist_contains(pid, video_id), READ_COST)
+                except _Defer:
+                    raise
+                except Exception as err:
+                    rep.errors.append(f"could not verify {label} ({type(err).__name__}); will retry next run")
+                    return "queued", ""
+                if present:
+                    st.complete_filing(video_id, pid, now)
+                    rep.already += 1
+                    return "done", ""
+                st.clear_attempts(video_id, pid)
+
+            def attempt() -> None:
+                st.begin_attempt(video_id, pid, channel_id, now)  # written before the insert is sent
+                try:
+                    self.yt.insert_into_playlist(pid, video_id)
+                except ServerError:
+                    raise  # may have been applied: leave the attempt on record
+                except YouTubeError:
+                    st.undo_attempt(video_id, pid)  # the API rejected it
+                    raise
+
+            self.call(attempt, INSERT_COST)
+        except _Defer:
+            st.queue_pending(video_id, pid, channel_id, now, "deferred")
+            return "queued", ""
+        except AlreadyInPlaylistError:
+            st.complete_filing(video_id, pid, now)
+            rep.already += 1
+            return "done", ""
+        except PlaylistFullError:
+            st.drop_pending(video_id, pid)
+            rep.full_playlists.add(pid)
+            rep.errors.append(f"playlist {rep.titles.get(pid, pid)} is full ({PLAYLIST_LIMIT} items); skipping it")
+            return "full", ""
+        except ServerError as err:
+            rep.errors.append(f"insert {label}: {err} Outcome unknown; will verify next run.")
+            return "queued", ""
+        except YouTubeError as err:
+            st.drop_pending(video_id, pid)
+            rep.errors.append(f"insert {label}: {err}")
+            return "failed", str(err)
+        except Exception as err:  # timeout, network error: the insert may or may not have happened
+            rep.errors.append(f"insert {label}: {type(err).__name__}; outcome unknown, will verify next run")
+            return "queued", ""
+        st.complete_filing(video_id, pid, now)
+        rep.filed[pid] += 1
+        return "done", ""
+
+
 def run(
     graph: Graph,
     yt: YouTubeAPI,
@@ -111,9 +218,10 @@ def run(
     """Execute one run. In a dry run `state` must be a throwaway copy. Quota used is persisted even on failure."""
     day = quota_day(now)
     report = Report(dry_run=dry_run, budget=budget)
+    ctx = _Ctx(yt, state, meter, now, day, report, sleep)
     run_id = None if dry_run else state.start_run(now)
     try:
-        _run(graph, yt, state, meter, now, day, report, allow_any_playlist, fetch, sleep, backfill)
+        _run(ctx, graph, allow_any_playlist, fetch, backfill)
     except QuotaExceededError:
         report.quota_stopped = True
         report.errors.append("YouTube quota exceeded; stopped cleanly. It resets at midnight Pacific time.")
@@ -122,7 +230,9 @@ def run(
     finally:
         report.units_run = meter.total
         if not dry_run:
-            state.add_quota(day, meter.total)
+            ctx.flush()
+            dests = set(_destinations(graph))
+            report.deferred = sum(1 for _v, pid, _c, _a in state.pending_rows() if pid in dests)
         report.units_today = state.quota_used(day)
         if not dry_run:
             state.finish_run(run_id, now, _summary(report))
@@ -136,7 +246,8 @@ def _summary(r: Report) -> dict:
     }
 
 
-def _run(graph, yt, state, meter, now, day, report, allow_any, fetch, sleep, backfill) -> None:
+def _run(ctx: _Ctx, graph: Graph, allow_any: bool, fetch: Fetcher, backfill: int) -> None:
+    state, report, yt, now = ctx.state, ctx.report, ctx.yt, ctx.now
     dests = _destinations(graph)
     owned = {p["id"]: p["snippet"]["title"] for p in yt.my_playlists()}
     report.titles = {pid: owned.get(pid) or t or pid for pid, t in dests.items()}
@@ -149,14 +260,21 @@ def _run(graph, yt, state, meter, now, day, report, allow_any, fetch, sleep, bac
             ]
             return
 
+    # Filings carried over from earlier runs go first; they do not depend on the RSS window.
+    handled: dict[tuple[str, str], tuple[str, str]] = {}
+    if not report.dry_run:
+        for vid, pid, ch, _attempts in state.pending_rows():
+            if pid in dests:
+                handled[(vid, pid)] = ctx.file(vid, ch, pid)
+                if ctx.stop:
+                    return
+
     detection, subs = detect_recent(graph, yt, state, now, fetch, backfill)
     videos = detection.videos
     report.new_videos = len(videos)
     report.fallback_channels = len(detection.fallback_channels)
     for ch, kind in detection.errors:
         report.errors.append(f"channel {ch}: {kind}")
-    if not videos:
-        return
 
     result = execute(graph, videos, now, subscriptions=subs)
     by_id = {v.video_id: v for v in videos}
@@ -168,95 +286,45 @@ def _run(graph, yt, state, meter, now, day, report, allow_any, fetch, sleep, bac
         filings.setdefault(vid, []).append(pid)
 
     if report.dry_run:
-        _project(report, state, day, result, by_id, filings, meter)
+        _project(report, state, ctx.day, result, by_id, filings, ctx.meter, set(dests))
         return
 
     for v in videos:
-        if v.video_id not in filings:  # nothing to file: fully handled
-            state.mark_seen(v.video_id, v.channel_id, now)
-
-    stop = False  # quota error: nothing more can be inserted this run
-    for v in videos:
         pids = filings.get(v.video_id)
-        if not pids:
+        if not pids:  # nothing to file: fully handled
+            state.mark_seen(v.video_id, v.channel_id, now)
             continue
-        failed: list[str] = []
-        unfinished = False
-        for pid in pids:
-            if state.is_filed(v.video_id, pid):
-                report.already += 1
-                continue
-            if pid in report.full_playlists:
-                failed.append(f"playlist {pid} is full")
-                continue
-            if stop or state.quota_used(day) + meter.total + INSERT_COST > report.budget:
-                report.deferred += 1
-                unfinished = True
-                continue
-            outcome = _insert(yt, state, report, v, pid, now, sleep)
-            if outcome == "quota":
-                stop = True
-                report.quota_stopped = True
-                report.deferred += 1
-                unfinished = True
-            elif outcome == "deferred":
-                report.deferred += 1
-                unfinished = True
-            elif outcome:
-                failed.append(outcome)
-        _settle(state, report, v, now, failed, unfinished)
+        results = [handled.get((v.video_id, pid)) or ctx.file(v.video_id, v.channel_id, pid) for pid in pids]
+        _settle(state, report, v, now, results)
 
 
-def _insert(yt, state, report, v: Video, pid: str, now, sleep) -> str | None:
-    """Insert one filing. None on success/already there; 'quota'/'deferred' when it must wait; else an error text."""
-    for attempt in (1, 2):
-        try:
-            yt.insert_into_playlist(pid, v.video_id)
-        except AlreadyInPlaylistError:
-            state.mark_filed(v.video_id, pid, now)
-            report.already += 1
-            return None
-        except QuotaExceededError:
-            report.errors.append("YouTube quota exceeded; stopped inserting. It resets at midnight Pacific time.")
-            return "quota"
-        except RateLimitedError:
-            if attempt == 1:
-                sleep(RATE_LIMIT_PAUSE_SECONDS)
-                continue
-            report.errors.append(f"rate limited inserting {v.video_id}; deferred to the next run")
-            return "deferred"
-        except PlaylistFullError:
-            report.full_playlists.add(pid)
-            report.errors.append(f"playlist {report.titles.get(pid, pid)} is full ({PLAYLIST_LIMIT} items); skipping it")
-            return f"playlist {pid} is full"
-        except YouTubeError as err:
-            report.errors.append(f"insert {v.video_id} into {report.titles.get(pid, pid)}: {err}")
-            return str(err)
-        state.mark_filed(v.video_id, pid, now)
-        report.filed[pid] += 1
-        return None
-    return "deferred"  # unreachable
+def _settle(state: State, report: Report, v: Video, now, results: list[tuple[str, str]]) -> None:
+    """Mark the video seen once every filing is done or queued (the queue carries it over).
 
-
-def _settle(state, report, v: Video, now, failed: list[str], unfinished: bool) -> None:
-    """Mark the video seen when fully handled; count a failed run and give up after the cap."""
+    A definite failure counts toward the give-up cap, but a video with filings still unfinished (queued or in a full
+    playlist) is never given up, and those unfinished filings are never counted as failures.
+    """
+    statuses = {s for s, _ in results}
+    failed = [m for s, m in results if s == "failed"]
+    unfinished = bool(statuses & {"queued", "full"})
     if failed:
-        if state.record_failure(v.video_id, "; ".join(failed)[:300], MAX_FAILED_RUNS):
+        if state.record_failure(v.video_id, "; ".join(failed)[:300], MAX_FAILED_RUNS, allow_give_up=not unfinished):
             state.mark_seen(v.video_id, v.channel_id, now)
             report.gave_up.append(v.video_id)
-    elif not unfinished:
+    elif "full" not in statuses:
         state.mark_seen(v.video_id, v.channel_id, now)
 
 
-def _project(report, state, day, result, by_id, filings, meter) -> None:
+def _project(report, state, day, result, by_id, filings, meter, dests) -> None:
     report.result = result
     report.video_titles = {vid: v.title for vid, v in by_id.items()}
-    for vid, pids in filings.items():
-        for pid in pids:
-            if state.is_filed(vid, pid):
-                report.already += 1
-            else:
-                report.projected[pid] += 1
+    wanted = {(vid, pid) for vid, pids in filings.items() for pid in pids}
+    wanted |= {(vid, pid) for vid, pid, _c, _a in state.pending_rows() if pid in dests}  # carried over
+    for vid, pid in sorted(wanted):
+        if state.is_filed(vid, pid):
+            report.already += 1
+        else:
+            report.projected[pid] += 1
     inserts = sum(report.projected.values())
     room = max(0, (report.budget - state.quota_used(day) - meter.total) // INSERT_COST)
     report.deferred = max(0, inserts - room)

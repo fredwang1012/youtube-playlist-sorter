@@ -1,4 +1,5 @@
 """Run command: detection -> graph -> inserts with the quota guard, against a fake YouTube client."""
+import hashlib
 import json
 from datetime import datetime, timezone
 
@@ -14,11 +15,13 @@ from app.youtube import (
     PlaylistFullError,
     QuotaExceededError,
     QuotaMeter,
+    RealYouTube,
+    ServerError,
     RateLimitedError,
     YouTubeError,
     _map_error,
 )
-from tests.test_auth import http_error
+from tests.test_auth import FakeService, http_error
 from tests.test_detect import CH, feed_xml, video_item
 
 NOW = datetime(2026, 10, 30, 9, 0, tzinfo=timezone.utc)  # 02:00 Pacific, same day
@@ -34,7 +37,9 @@ class FakeYT:
         self.owned = list(owned)
         self.subs = list(subs)
         self.inserts = []
-        self.insert_errors = {}  # (playlist, video) -> exceptions to raise in turn
+        self.insert_errors = {}  # (playlist, video) -> exceptions to raise in turn (insert not applied)
+        self.accept_then_raise = {}  # same, but YouTube applies the insert before the error reaches the caller
+        self.present = set()
         self.calls = []
 
     def _read(self, name):
@@ -60,6 +65,14 @@ class FakeYT:
         if errs:
             raise errs.pop(0)
         self.inserts.append((playlist_id, video_id))
+        self.present.add((playlist_id, video_id))
+        errs = self.accept_then_raise.get((playlist_id, video_id))
+        if errs:
+            raise errs.pop(0)
+
+    def playlist_contains(self, playlist_id, video_id):
+        self._read("contains")
+        return (playlist_id, video_id) in self.present
 
 
 def graph(*playlists):
@@ -177,19 +190,27 @@ def test_budget_stop_and_carry_over(state):
     yt = FakeYT()
     r = go(graph(), yt, state, ["v1", "v2", "v3"], budget=2 + 2 * INSERT_COST)  # 2 reads + two inserts
     assert yt.inserts == [(PL1, "v1"), (PL1, "v2")] and r.deferred == 1
-    assert state.seen(["v1", "v2", "v3"]) == {"v1", "v2"}
+    assert state.pending_rows() == [("v3", PL1, CH, 0)]  # carried over in the pending queue
     assert "Deferred to the next run: 1" in runner.render(r)
     fresh_meter(yt)
     r = go(graph(), yt, state, ["v1", "v2", "v3"])
     assert yt.inserts == [(PL1, "v1"), (PL1, "v2"), (PL1, "v3")] and r.deferred == 0
-    assert state.seen(["v3"]) == {"v3"}
+    assert state.pending_rows() == [] and state.is_filed("v3", PL1)
+
+
+def test_deferred_video_gone_from_feed_is_still_filed(state):
+    yt = FakeYT()
+    go(graph(), yt, state, ["v1", "v2", "v3"], budget=2 + 2 * INSERT_COST)
+    fresh_meter(yt)
+    r = go(graph(), yt, state, ["v9"])  # v3 has dropped out of the feed
+    assert (PL1, "v3") in yt.inserts and r.filed[PL1] == 2 and r.deferred == 0
 
 
 def test_budget_counts_units_already_used_today(state):
     state.add_quota(DAY, 7990)
     yt = FakeYT()
     r = go(graph(), yt, state, ["v1"], budget=8000)
-    assert yt.inserts == [] and r.deferred == 1 and state.seen(["v1"]) == set()
+    assert yt.inserts == [] and r.deferred == 1 and state.pending_rows() == [("v1", PL1, CH, 0)]
 
 
 def test_insert_error_does_not_stop_others_and_gives_up_after_three_runs(state):
@@ -224,7 +245,9 @@ def test_quota_exceeded_stops_cleanly_and_saves_state(state):
     r = go(graph(), yt, state, ["v1", "v2", "v3"])
     assert yt.inserts == [(PL1, "v1")] and yt.calls.count("insert") == 2
     assert r.quota_stopped and r.deferred == 2
-    assert state.seen(["v1", "v2", "v3"]) == {"v1"} and state.is_filed("v1", PL1)
+    assert state.is_filed("v1", PL1) and not state.is_filed("v2", PL1)
+    assert [row[0] for row in state.pending_rows()] == ["v2", "v3"]  # carried over
+    assert all(row[3] == 0 for row in state.pending_rows())  # a rejected insert is not a maybe-sent one
     assert state.quota_used(DAY) == yt.meter.total  # the failed call is metered and persisted
     assert state._db.execute("SELECT finished_at FROM runs").fetchone()[0] is not None
 
@@ -253,7 +276,7 @@ def test_rate_limit_twice_defers_video(state):
     yt.insert_errors[(PL1, "v1")] = [RateLimitedError("r")] * 2
     r = go(graph(), yt, state, ["v1", "v2"])
     assert r.deferred == 1 and yt.inserts == [(PL1, "v2")]
-    assert state.seen(["v1"]) == set() and state.failures("v1") == 0
+    assert state.pending_rows() == [("v1", PL1, CH, 0)] and state.failures("v1") == 0
 
 
 def test_playlist_full_skips_further_inserts(state):
@@ -262,7 +285,8 @@ def test_playlist_full_skips_further_inserts(state):
     r = go(graph(), yt, state, ["v1", "v2"])
     assert yt.calls.count("insert") == 1 and PL1 in r.full_playlists
     assert any("full" in e for e in r.errors)
-    assert state.failures("v2") == 1
+    assert state.failures("v1") == 0 and state.failures("v2") == 0  # a full playlist is not a failure
+    assert state.seen(["v1", "v2"]) == set()
 
 
 def test_foreign_playlist_is_a_config_error_before_any_work(state):
@@ -352,3 +376,126 @@ def test_cli_dry_run_and_preview_end_to_end(monkeypatch, capsys, tmp_path):
     assert "v1" in capsys.readouterr().out
     assert cli.main(["preview", "--graph", str(gpath), "--node", "nope"]) == 1
     capsys.readouterr()
+
+
+# --- crash recovery, pending queue, accounting ---
+
+class Crash(BaseException):
+    """Simulates the process dying; not caught by the run's error handling."""
+
+
+def test_crash_after_accepted_insert_does_not_reinsert(state):
+    yt = FakeYT()
+    yt.accept_then_raise[(PL1, "v1")] = [Crash()]
+    with pytest.raises(Crash):
+        go(graph(), yt, state, ["v1"])
+    assert yt.inserts == [(PL1, "v1")] and state.pending_rows() == [("v1", PL1, CH, 1)]
+    assert not state.is_filed("v1", PL1) and state.seen(["v1"]) == set()
+    fresh_meter(yt)
+    r = go(graph(), yt, state, ["v1"])
+    assert yt.inserts == [(PL1, "v1")]  # still exactly one copy
+    assert state.is_filed("v1", PL1) and state.pending_rows() == [] and state.seen(["v1"]) == {"v1"}
+    assert yt.meter.by_call["contains"] == 1 and r.errors == []
+
+
+def test_timeout_after_accepted_insert_is_verified_not_reinserted(state):
+    yt = FakeYT()
+    yt.accept_then_raise[(PL1, "v1")] = [TimeoutError("slow")]
+    r = go(graph(), yt, state, ["v1"])
+    assert any("outcome unknown" in e for e in r.errors) and state.pending_rows() == [("v1", PL1, CH, 1)]
+    assert r.deferred == 1
+    fresh_meter(yt)
+    go(graph(), yt, state, ["v1"])
+    assert yt.inserts == [(PL1, "v1")] and state.is_filed("v1", PL1)
+    assert yt.meter.total == 2  # playlists.list + the 1-unit check
+
+
+def test_timeout_before_insert_is_checked_then_inserted_once(state):
+    yt = FakeYT()
+    yt.insert_errors[(PL1, "v1")] = [TimeoutError("lost")]
+    go(graph(), yt, state, ["v1"])
+    assert yt.inserts == []
+    fresh_meter(yt)
+    go(graph(), yt, state, ["v1"])
+    assert yt.inserts == [(PL1, "v1")] and yt.calls.count("contains") == 1
+    assert state.is_filed("v1", PL1) and state.pending_rows() == []
+
+
+def test_server_error_is_treated_as_ambiguous(state):
+    yt = FakeYT()
+    yt.accept_then_raise[(PL1, "v1")] = [ServerError("503")]
+    go(graph(), yt, state, ["v1"])
+    assert state.pending_rows() == [("v1", PL1, CH, 1)] and state.failures("v1") == 0
+    fresh_meter(yt)
+    go(graph(), yt, state, ["v1"])
+    assert yt.inserts == [(PL1, "v1")]
+
+
+def test_rejected_insert_leaves_no_maybe_sent_row(state):
+    yt = FakeYT()
+    yt.insert_errors[(PL1, "v1")] = [YouTubeError("bad")]
+    go(graph(), yt, state, ["v1"])
+    assert state.pending_rows() == []
+
+
+def test_deferred_filings_never_count_toward_give_up(state):
+    yt = FakeYT()
+    yt.insert_errors[(PL1, "v1")] = [YouTubeError("boom")] * 3
+    yt.insert_errors[(PL2, "v1")] = [RateLimitedError("r")] * 6
+    for _ in range(3):
+        fresh_meter(yt)
+        go(graph(PL1, PL2), yt, state, ["v1"])
+    assert state.failures("v1") == 3 and state.gave_up() == [] and state.seen(["v1"]) == set()
+    assert state.pending_rows() == [("v1", PL2, CH, 0)]
+    fresh_meter(yt)
+    go(graph(PL1, PL2), yt, state, ["v1"])  # no errors left: both filings go through
+    assert state.is_filed("v1", PL1) and state.is_filed("v1", PL2) and state.seen(["v1"]) == {"v1"}
+
+
+def test_budget_rechecked_before_rate_limit_retry(state):
+    yt = FakeYT()
+    yt.insert_errors[(PL1, "v1")] = [RateLimitedError("r")]
+    # 2 reads + one insert fits; after the failed (still charged) insert a second one would not
+    r = go(graph(), yt, state, ["v1"], budget=2 + INSERT_COST + 10)
+    assert yt.calls.count("insert") == 1 and r.deferred == 1 and yt.inserts == []
+
+
+def test_units_are_saved_as_they_are_spent(state, monkeypatch):
+    yt = FakeYT()
+
+    def die(*a, **k):
+        raise Crash()
+
+    monkeypatch.setattr(state, "complete_filing", die)
+    with pytest.raises(Crash):
+        go(graph(), yt, state, ["v1", "v2"])
+    assert state.quota_used(DAY) == yt.meter.total == 2 + INSERT_COST
+
+
+def test_dry_run_leaves_real_state_file_byte_identical(state):
+    path = settings.data_dir / "state.db"
+    state.add_quota(DAY, 123)
+    state.mark_filed("old", PL1, NOW)
+    state.queue_pending("q1", PL1, CH, NOW, "deferred")
+    state.mark_seen("seen1", CH, NOW)
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    files = sorted(p.name for p in path.parent.iterdir())
+    snap = State.throwaway_copy(path)
+    r = go(graph(), FakeYT(), snap, ["v1", "v2"], dry_run=True)
+    snap.close()
+    assert r.projected[PL1] == 3  # two new videos plus the carried-over one
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+    assert sorted(p.name for p in path.parent.iterdir()) == files
+
+
+def test_playlist_contains_costs_one_unit_and_is_read_only():
+    svc = FakeService(playlistItems=[{"items": [{"id": "x"}]}, {"items": []}])
+    meter = QuotaMeter()
+    yt = RealYouTube(svc, meter)
+    assert yt.playlist_contains("PL1", "vid") is True and yt.playlist_contains("PL1", "other") is False
+    assert meter.total == 2 and meter.by_call == {"playlistItems.list": 2}
+    assert svc.log[0] == ("playlistItems", "list", {"part": "id", "playlistId": "PL1", "videoId": "vid", "maxResults": 1})
+
+
+def test_5xx_maps_to_server_error():
+    assert isinstance(_map_error(http_error(503, "backendError"), "x"), ServerError)

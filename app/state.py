@@ -17,6 +17,10 @@ CREATE TABLE IF NOT EXISTS quota_log (day TEXT PRIMARY KEY, units INTEGER NOT NU
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS attempts (
     video_id TEXT PRIMARY KEY, failures INTEGER NOT NULL, gave_up INTEGER NOT NULL DEFAULT 0, last_error TEXT);
+CREATE TABLE IF NOT EXISTS pending (
+    video_id TEXT NOT NULL, playlist_id TEXT NOT NULL, channel_id TEXT NOT NULL, created_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0, reason TEXT,
+    UNIQUE (video_id, playlist_id));
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, finished_at TEXT, summary TEXT);
 """
@@ -127,10 +131,10 @@ class State:
         row = self._db.execute("SELECT failures FROM attempts WHERE video_id = ?", (video_id,)).fetchone()
         return row[0] if row else 0
 
-    def record_failure(self, video_id: str, error: str, give_up_after: int) -> bool:
-        """Count one failed run for the video; True if it has now reached the cap and is given up."""
+    def record_failure(self, video_id: str, error: str, give_up_after: int, allow_give_up: bool = True) -> bool:
+        """Count one failed run for the video; True if it has reached the cap and (if allowed) is given up."""
         n = self.failures(video_id) + 1
-        gave_up = n >= give_up_after
+        gave_up = allow_give_up and n >= give_up_after
         with self._db:
             self._db.execute(
                 "INSERT INTO attempts (video_id, failures, gave_up, last_error) VALUES (?, ?, ?, ?) "
@@ -143,3 +147,62 @@ class State:
     def gave_up(self) -> list[tuple[str, str]]:
         rows = self._db.execute("SELECT video_id, last_error FROM attempts WHERE gave_up = 1 ORDER BY video_id")
         return [(r[0], r[1] or "") for r in rows]
+
+    # pending: filings still to do (attempts == 0: deferred) or that may have been accepted (attempts > 0)
+
+    def pending_rows(self) -> list[tuple[str, str, str, int]]:
+        rows = self._db.execute(
+            "SELECT video_id, playlist_id, channel_id, attempts FROM pending ORDER BY created_at, rowid"
+        )
+        return [tuple(r) for r in rows]
+
+    def pending_attempts(self, video_id: str, playlist_id: str) -> int | None:
+        row = self._db.execute(
+            "SELECT attempts FROM pending WHERE video_id = ? AND playlist_id = ?", (video_id, playlist_id)
+        ).fetchone()
+        return row[0] if row else None
+
+    def queue_pending(self, video_id: str, playlist_id: str, channel_id: str, now: datetime, reason: str) -> None:
+        with self._db:
+            self._db.execute(
+                "INSERT INTO pending (video_id, playlist_id, channel_id, created_at, reason) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(video_id, playlist_id) DO UPDATE SET reason = excluded.reason",
+                (video_id, playlist_id, channel_id, now.isoformat(), reason),
+            )
+
+    def begin_attempt(self, video_id: str, playlist_id: str, channel_id: str, now: datetime) -> None:
+        """Written before an insert is sent: if the process dies, the row says the insert may have gone through."""
+        with self._db:
+            self._db.execute(
+                "INSERT INTO pending (video_id, playlist_id, channel_id, created_at, attempts, reason) "
+                "VALUES (?, ?, ?, ?, 1, 'inserting') "
+                "ON CONFLICT(video_id, playlist_id) DO UPDATE SET attempts = attempts + 1, reason = 'inserting'",
+                (video_id, playlist_id, channel_id, now.isoformat()),
+            )
+
+    def undo_attempt(self, video_id: str, playlist_id: str) -> None:
+        """The insert was definitely rejected: it is not a maybe-accepted attempt."""
+        with self._db:
+            self._db.execute(
+                "UPDATE pending SET attempts = MAX(attempts - 1, 0) WHERE video_id = ? AND playlist_id = ?",
+                (video_id, playlist_id),
+            )
+
+    def clear_attempts(self, video_id: str, playlist_id: str) -> None:
+        with self._db:
+            self._db.execute(
+                "UPDATE pending SET attempts = 0 WHERE video_id = ? AND playlist_id = ?", (video_id, playlist_id)
+            )
+
+    def drop_pending(self, video_id: str, playlist_id: str) -> None:
+        with self._db:
+            self._db.execute("DELETE FROM pending WHERE video_id = ? AND playlist_id = ?", (video_id, playlist_id))
+
+    def complete_filing(self, video_id: str, playlist_id: str, now: datetime) -> None:
+        """Record the filing and clear its pending row in one transaction."""
+        with self._db:
+            self._db.execute(
+                "INSERT OR IGNORE INTO filed (video_id, playlist_id, at) VALUES (?, ?, ?)",
+                (video_id, playlist_id, now.isoformat()),
+            )
+            self._db.execute("DELETE FROM pending WHERE video_id = ? AND playlist_id = ?", (video_id, playlist_id))

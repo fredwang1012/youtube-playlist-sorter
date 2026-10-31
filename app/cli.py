@@ -94,7 +94,7 @@ COMMANDS = {
     "run": cmd_run, "preview": cmd_preview,
 }
 AUTH_EXPIRED = (
-    "Google sign-in expired or was revoked — run: py -3.12 -m uv run python -m app.cli auth "
+    "Google sign-in expired or was revoked - run: py -3.12 -m uv run python -m app.cli auth "
     "(an app left in Testing mode expires every 7 days)"
 )
 
