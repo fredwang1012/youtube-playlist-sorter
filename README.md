@@ -213,6 +213,15 @@ already in progress (real runs take a lock on `data/run.lock`; dry runs and `pre
 Read the log with `Get-Content data\run.log -Tail 40` in PowerShell. If it says Google sign-in expired or was
 revoked, run `auth` again.
 
+## Running on a server
+
+The web UI and the scheduled runs can live on a small Linux VM, so they work with the laptop off. A systemd service
+serves the page on `127.0.0.1`, a systemd timer runs the sort every 6 hours, `tailscale serve` publishes it as HTTPS
+on the tailnet (never Funnel), and the secrets are encrypted with `systemd-creds`. The kit is in `deploy/`
+(`setup.sh` on the VM, `push.sh` from Git Bash on the laptop, and the unit files). Setup, the security model, checks
+and how to revoke everything: [docs/REMOTE.md](docs/REMOTE.md). Once the VM runs real sorts, keep the laptop for dry
+runs and turn off the Windows scheduled task.
+
 ## Tests
 
 ```bash

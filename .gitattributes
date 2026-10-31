@@ -1,0 +1,3 @@
+# the deploy kit runs on Linux: keep LF even where core.autocrlf is on
+deploy/** text eol=lf
+*.sh text eol=lf

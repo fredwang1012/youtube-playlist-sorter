@@ -1,0 +1,43 @@
+# youtube-playlist-sorter web UI and API on 127.0.0.1:BIND_PORT (8765), published to the tailnet by tailscale serve.
+# Installed to /etc/systemd/system by deploy/push.sh. Setup and secrets: docs/REMOTE.md.
+[Unit]
+Description=youtube-playlist-sorter web UI and API
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ytps
+Group=ytps
+WorkingDirectory=/opt/ytps
+# settings that are not secrets: PUBLIC_URL, AUTH_MODE, LOGIN_CLIENT_ID, ...
+EnvironmentFile=/etc/ytps/env
+Environment=SECRETS_BACKEND=systemd
+Environment=DATA_DIR=/var/lib/ytps
+Environment=GRAPH_PATH=/var/lib/ytps/mine.yaml
+Environment=CLIENT_SECRET_PATH=/etc/ytps/client_secret.json
+Environment=UV_PROJECT_ENVIRONMENT=/opt/ytps-venv
+Environment=UV_PYTHON_INSTALL_DIR=/opt/ytps-python
+Environment=UV_PYTHON_DOWNLOADS=never
+Environment=UV_CACHE_DIR=/var/lib/ytps/.cache/uv
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+# decrypted by systemd into $CREDENTIALS_DIRECTORY, readable only by this service
+LoadCredentialEncrypted=refresh-token:/etc/ytps/creds/refresh-token.cred
+LoadCredentialEncrypted=login-client-secret:/etc/ytps/creds/login-client-secret.cred
+LoadCredentialEncrypted=session-key:/etc/ytps/creds/session-key.cred
+ExecStart=/usr/local/bin/uv run --no-sync python -m app.cli serve
+Restart=on-failure
+RestartSec=10
+UMask=0077
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/ytps
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -44,6 +44,7 @@ def set(name: str, value: str) -> None:  # noqa: A001 - module-level API reads a
         keyring.set_password(KEYRING_SERVICE, name, value)
         return
     raise ReadOnlySecretStore(
-        f"Secret '{name}' cannot be saved on the server. Encrypt it on the VM with "
-        f"'systemd-creds encrypt --name={name} - /etc/credstore.encrypted/{name}' and restart the service."
+        f"Secret '{name}' cannot be saved on the server. Encrypt it on the VM into /etc/ytps/creds with "
+        f"systemd-creds encrypt ('sudo bash /opt/ytps/deploy/setup.sh secret {name}', see docs/REMOTE.md) "
+        f"and restart the service."
     )
